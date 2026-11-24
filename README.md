@@ -154,8 +154,8 @@ A: 未带 `token` 时只返回落地页。请在地址后加 `/sub/你的TOKEN` 
 **Q: 访客 token 怎么算？**
 A: 固定访客 token = `MD5(TOKEN)`；当日访客 token = `MD5(TOKEN + 当天 UTC 日期)`，日期格式 `YYYY-MM-DD`，例如 `MD5(mysecret2026-11-24)`。可用 `echo -n "TOKEN2026-11-24" | md5sum` 计算。
 
-**Q: IP 识别失败或识别出的城市不对？**
-A: 识别依次尝试 ipwho.is、ipapi.co、ipinfo.io 三个免费接口（Cloudflare 出口 IP 会被其中个别接口拦截，所以用多源兜底）。城市名用常见 IATA 代码缩写（如 Los Angeles → LAX、San Francisco → SFO），不在映射表里的城市用大写城市名。识别出的标签可以手动改，改完保存即可。
+**Q: 上游订阅拉取失败（管理页统计里“订阅失败”不为 0）？**
+A: 先确认上游地址本身能打开。特别注意：**订阅地址必须用域名，不能直接写 IP 地址**——Cloudflare Workers 拒绝直接请求 IP 字面地址（Cloudflare 错误 1003 “Direct IP access not allowed”），例如 `http://129.225.156.182:23469/...` 会失败，改成 `http://osaka.bob.kdns.fr:23469/...` 这种域名形式就能正常拉取。端口没有限制，IPv6 字面地址同样会被拦截。
 
 **Q: 订阅刷新后节点数变少了？**
 A: 可能是某个上游订阅拉取失败（8 秒超时）或个别节点解析失败。打开已鉴权的首页可看到统计（直连数、订阅成功/失败数、解析失败数）。
@@ -330,6 +330,9 @@ A: Fixed guest token = `MD5(TOKEN)`; daily guest token = `MD5(TOKEN + current UT
 
 **Q: IP detection fails or returns the wrong city?**
 A: Detection tries three free providers in turn (ipwho.is, ipapi.co, ipinfo.io), because Cloudflare's egress IPs are blocked by some of them. City names use common IATA codes (Los Angeles → LAX, San Francisco → SFO); cities outside the built-in map use the uppercased city name. A detected label can be edited by hand before saving.
+
+**Q: An upstream subscription fails to fetch ("订阅失败" is not 0 in the dashboard stats)?**
+A: First check that the upstream URL opens at all. Important: **subscription URLs must use a domain name, not a raw IP address** — Cloudflare Workers refuse direct requests to IP literals (Cloudflare error 1003 "Direct IP access not allowed"). For example, `http://129.225.156.182:23469/...` fails, while `http://osaka.bob.kdns.fr:23469/...` fetches fine. Ports are not restricted; IPv6 literals are blocked the same way.
 
 **Q: Fewer nodes after refreshing the subscription?**
 A: An upstream subscription may have failed to fetch (8s timeout) or individual nodes failed to parse. The authenticated homepage shows the stats (direct nodes, subscriptions ok/failed, parse failures).
