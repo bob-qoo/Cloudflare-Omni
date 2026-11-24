@@ -10,7 +10,7 @@ compatibility_date = "2026-11-24"
 #   npx wrangler kv namespace create OMNI_KV
 [[kv_namespaces]]
 binding = "OMNI_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "c35aa4d9cacd4a9e89ada75d9bbf59b3"
 
 # Caching uses the built-in Cache API; secrets live in Dashboard vars.
 
