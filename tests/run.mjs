@@ -761,6 +761,22 @@ await test('reality: a plain TLS node is unchanged', async () => {
   assert(!block.includes('reality-opts'), 'no reality-opts on a plain TLS node');
 });
 
+await test('cache: a pre-version cache entry is ignored after a version bump', async () => {
+  const env = { TOKEN: 'secret1', LINK: EDGE_NODE, OMNI_KV: new MockKV() };
+  // Poison the cache with a stale response under the OLD key format
+  // (no v= param): the current code must not serve it, because its key
+  // carries the CACHE_VERSION.
+  await caches.default.put(
+    'https://worker.test/sub?target=raw',
+    new Response('STALE-CACHED-BODY'),
+  );
+  const res = await call(env, `/sub?token=${env.TOKEN}&target=raw`);
+  assertEq(res.status, 200, 'sub status');
+  const out = await res.text();
+  assert(!out.includes('STALE-CACHED-BODY'), 'stale pre-version entry must not be served');
+  assert(out.includes('vless://'), 'fresh subscription returned instead');
+});
+
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------

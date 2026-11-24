@@ -3289,6 +3289,12 @@ function resolvePrefer(url, cfg) {
 // Cache (Cache API, TTL = SUBUPTIME hours)
 // ---------------------------------------------------------------------------
 
+// Bump this whenever the generated subscription output changes in a way
+// that must invalidate previously cached responses (e.g. a fix to the
+// Clash/sing-box generator). Old entries are then orphaned and expire
+// on their own; new requests compute a fresh key and re-aggregate.
+const CACHE_VERSION = '2';
+
 function cacheTtlSeconds(env) {
   const h = parseInt(env.SUBUPTIME, 10);
   const hours = Number.isFinite(h) && h > 0 ? h : DEFAULT_UPTIME_HOURS;
@@ -3305,6 +3311,7 @@ function cacheRequestFor(request, target, preferIp, preferDomain) {
   u.searchParams.delete('preferDomain');
   u.searchParams.delete('region'); // region only affects the auto-pick, which the resolved ip already captures
   u.searchParams.set('target', target);
+  u.searchParams.set('v', CACHE_VERSION);
   if (preferIp) u.searchParams.set('ip', preferIp);
   else u.searchParams.delete('ip');
   if (preferDomain) u.searchParams.set('domain', preferDomain);
