@@ -1582,8 +1582,11 @@ function clashProxy(node) {
       L.push(`    uuid: ${yamlScalar(node.uuid)}`);
       if (node.flow) L.push(`    flow: ${yamlScalar(node.flow)}`);
       L.push(`    network: ${yamlScalar(node.type)}`);
-      L.push(`    tls: ${node.tls ? 'true' : 'false'}`);
-      if (node.tls) {
+      // REALITY runs over TLS: a node with reality-opts must have tls: true,
+      // otherwise mihomo rejects it with "REALITY requires TLS".
+      const useTls = node.tls || !!node.params.pbk;
+      L.push(`    tls: ${useTls ? 'true' : 'false'}`);
+      if (useTls) {
         if (node.sni) L.push(`    servername: ${yamlScalar(node.sni)}`);
         tlsBlock();
       }
@@ -1796,7 +1799,9 @@ function singboxTransport(node) {
 
 /** sing-box TLS object for a normalized node (or undefined). */
 function singboxTls(node) {
-  if (!node.tls) return undefined;
+  // REALITY runs over TLS: a node with a reality public key needs the tls
+  // block even when node.tls is false, otherwise the reality info is lost.
+  if (!node.tls && !node.params.pbk) return undefined;
   const tls = { enabled: true };
   if (node.sni) tls.server_name = node.sni;
   if (node.params.allowInsecure === '1') tls.insecure = true;

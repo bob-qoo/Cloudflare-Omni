@@ -715,6 +715,53 @@ await test('label: unlabelled IP keeps the (优选) suffix', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// REALITY nodes must carry TLS (mihomo: "REALITY requires TLS")
+// ---------------------------------------------------------------------------
+
+// A VLESS REALITY link: security=reality, so the parsed node has tls=false,
+// but REALITY runs over TLS — the Clash/sing-box output must still say TLS.
+const REALITY_NODE =
+  'vless://550e8400-e29b-41d4-a716-446655440000@192.0.2.10:443' +
+  '?encryption=none&flow=xtls-rprx-vision&security=reality&sni=example.com' +
+  '&fp=chrome&pbk=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd&sid=01234567&type=tcp&headerType=none#RealityNode';
+
+async function subTarget(env, target) {
+  const res = await call(env, `/sub?token=${env.TOKEN}&target=${target}&nocache=1`);
+  assertEq(res.status, 200, 'sub status');
+  return res.text();
+}
+
+await test('reality: clash output sets tls true for a REALITY node', async () => {
+  const env = { TOKEN: 'secret1', LINK: REALITY_NODE, OMNI_KV: new MockKV() };
+  const out = await subTarget(env, 'clash');
+  const block = out.split('  - name: RealityNode')[1];
+  assert(block, 'RealityNode present in clash output');
+  assert(block.includes('    tls: true'), 'tls true, got: ' + block.slice(0, 200));
+  assert(block.includes('    reality-opts:'), 'reality-opts present');
+  assert(block.includes('public-key: AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd'), 'public key kept');
+  assert(block.includes('servername: example.com'), 'servername kept for REALITY');
+});
+
+await test('reality: sing-box output keeps the tls block with reality', async () => {
+  const env = { TOKEN: 'secret1', LINK: REALITY_NODE, OMNI_KV: new MockKV() };
+  const out = await subTarget(env, 'singbox');
+  const doc = JSON.parse(out);
+  const o = doc.outbounds.find((x) => x.tag === 'RealityNode');
+  assert(o, 'RealityNode present in sing-box output');
+  assert(o.tls && o.tls.enabled === true, 'tls enabled');
+  assert(o.tls.reality && o.tls.reality.enabled === true, 'reality enabled');
+  assertEq(o.tls.reality.public_key, 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd', 'public key kept');
+});
+
+await test('reality: a plain TLS node is unchanged', async () => {
+  const env = { TOKEN: 'secret1', LINK: PLAIN_NODE, OMNI_KV: new MockKV() };
+  const out = await subTarget(env, 'clash');
+  const block = out.split('  - name: PlainNode')[1];
+  assert(block && block.includes('    tls: true'), 'plain TLS node still tls true');
+  assert(!block.includes('reality-opts'), 'no reality-opts on a plain TLS node');
+});
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 
