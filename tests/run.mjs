@@ -777,6 +777,35 @@ await test('cache: a pre-version cache entry is ignored after a version bump', a
   assert(out.includes('vless://'), 'fresh subscription returned instead');
 });
 
+// A VLESS node whose transport is xhttp (the Osaka/PHX argosbx nodes).
+const XHTTP_NODE =
+  'vless://550e8400-e29b-41d4-a716-446655440000@192.0.2.10:443' +
+  '?encryption=none&security=tls&sni=example.com&fp=chrome&type=xhttp&path=somepath&mode=auto#XhttpNode';
+
+await test('xhttp: clash output excludes xhttp nodes (mihomo drops them)', async () => {
+  const env = { TOKEN: 'secret1', LINK: REALITY_NODE + '\n' + XHTTP_NODE, OMNI_KV: new MockKV() };
+  const out = await subTarget(env, 'clash');
+  assert(!out.includes('XhttpNode'), 'xhttp node must not be in the clash output');
+  assert(!out.includes('network: xhttp'), 'no xhttp network in the clash output');
+  assert(out.includes('RealityNode'), 'other nodes are still present');
+});
+
+await test('xhttp: base64 output keeps xhttp nodes (for Xray clients)', async () => {
+  const env = { TOKEN: 'secret1', LINK: XHTTP_NODE, OMNI_KV: new MockKV() };
+  const out = await subRaw(env, '');
+  assert(decodeURIComponent(out).includes('type=xhttp'), 'xhttp node kept in raw/base64 output');
+});
+
+await test('userinfo: no subscription-userinfo header (no expiry, no usage bar)', async () => {
+  const env = { TOKEN: 'secret1', LINK: EDGE_NODE, OMNI_KV: new MockKV() };
+  for (const target of ['raw', 'clash', 'base64']) {
+    const res = await call(env, `/sub?token=${env.TOKEN}&target=${target}&nocache=1`);
+    assertEq(res.status, 200, 'sub status ' + target);
+    assertEq(res.headers.get('subscription-userinfo'), null, 'no userinfo header for ' + target);
+    assert(res.headers.get('profile-update-interval'), 'profile-update-interval still present for ' + target);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
