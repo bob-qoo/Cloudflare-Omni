@@ -58,6 +58,27 @@ globalThis.caches = {
   },
 };
 
+// Mock fetch for IPLIST lists and ipwho.is (geo detection). Tests register
+// a URL prefix -> { status, body, contentType }; any other fetch throws so
+// an unexpected upstream call surfaces immediately.
+const fetchMocks = new Map();
+globalThis.fetch = async (input) => {
+  const url = typeof input === 'string' ? input : input.url;
+  for (const [prefix, mock] of fetchMocks) {
+    if (url.startsWith(prefix)) {
+      return new Response(mock.body, {
+        status: mock.status || 200,
+        headers: { 'content-type': mock.contentType || 'text/plain' },
+      });
+    }
+  }
+  throw new Error('unexpected fetch in test: ' + url);
+};
+
+function mockFetch(prefix, body, contentType) {
+  fetchMocks.set(prefix, { body, contentType: contentType || 'text/plain' });
+}
+
 // ---------------------------------------------------------------------------
 // Test harness
 // ---------------------------------------------------------------------------
@@ -495,6 +516,202 @@ await test('admin: unknown /api route is 404', async () => {
   const env = { TOKEN: 'secret1', OMNI_KV: new MockKV() };
   const r = await callJson(env, '/api/nope?token=secret1');
   assertEq(r.res.status, 404, 'unknown api 404');
+});
+
+// ---------------------------------------------------------------------------
+// Path-based tokens (/admin/<token> and /sub/<token>)
+// ---------------------------------------------------------------------------
+
+await test('path token: /sub/<token> serves the subscription', async () => {
+  const env = poolEnv([{ ip: '2.2.2.2', region: 'US', latency: 20, enabled: true }]);
+  const res = await call(env, '/sub/secret1?target=raw&nocache=1');
+  assertEq(res.status, 200, 'sub via path token');
+  const out = await res.text();
+  assert(out.includes('vless://'), 'subscription body returned');
+  const guest = await call(env, `/sub/${md5('secret1')}?target=raw&nocache=1`);
+  assertEq(guest.status, 200, 'fixed guest token works in the path too');
+  const bad = await call(env, '/sub/nope?target=raw&nocache=1');
+  assertEq(bad.status, 200, 'wrong path token still returns a response');
+  assert(!(await bad.text()).includes('vless://'), 'wrong path token shows landing page, not nodes');
+});
+
+await test('path token: /admin/<token> serves the admin page', async () => {
+  const env = { TOKEN: 'secret1', OMNI_KV: new MockKV() };
+  const r = await call(env, '/admin/secret1');
+  assertEq(r.status, 200, 'admin page via path token');
+  const html = await r.text();
+  assert(html.includes('IP 库'), 'page mentions IP library');
+  assert(html.includes('在线 IP 列表'), 'page mentions online IP lists');
+  const bad = await call(env, '/admin/nope');
+  assertEq(bad.status, 403, 'wrong path token is 403');
+  // ?token= still works (backward compatible).
+  const q = await call(env, '/admin?token=secret1');
+  assertEq(q.status, 200, '?token= still works for /admin');
+});
+
+// ---------------------------------------------------------------------------
+// Online IP lists (IPLIST)
+// ---------------------------------------------------------------------------
+
+await test('iplist: config GET/POST carries the iplist field', async () => {
+  const kv = new MockKV();
+  const env = { TOKEN: 'secret1', OMNI_KV: kv };
+  const good = await callJson(env, '/api/config?token=secret1', jsonOpts({ iplist: 'https://example.com/ips.txt\nhttps://example.com/ips2.txt' }));
+  assertEq(good.res.status, 200, 'iplist patch accepted');
+  assertEq(good.json.config.iplist, 'https://example.com/ips.txt\nhttps://example.com/ips2.txt', 'iplist saved');
+  const g = await callJson(env, '/api/config?token=secret1');
+  assertEq(g.json.config.iplist, 'https://example.com/ips.txt\nhttps://example.com/ips2.txt', 'iplist round-trips');
+});
+
+await test('iplist: online list is fetched, parsed and listed by /api/ips/online', async () => {
+  mockFetch('https://example.com/list-a.txt', '1.1.1.1#HK#hk-1\n2.2.2.2#US\n# a comment\nbad-line\n');
+  const kv = new MockKV();
+  await kv.put('config', JSON.stringify({ iplist: 'https://example.com/list-a.txt' }));
+  const env = { TOKEN: 'secret1', OMNI_KV: kv };
+  const r = await callJson(env, '/api/ips/online', { headers: { Authorization: 'Bearer secret1' } });
+  assertEq(r.res.status, 200, 'online list status');
+  assertEq(r.json.total, 2, 'two valid entries (bad line skipped)');
+  assertEq(r.json.ips[0].ip, '1.1.1.1', 'first online ip');
+  assertEq(r.json.ips[0].label, 'hk-1', 'online label parsed');
+  assertEq(r.json.ips[0].source, 'https://example.com/list-a.txt', 'source recorded');
+});
+
+await test('iplist: auto-pick uses online IPs when the KV library is empty', async () => {
+  mockFetch('https://example.com/list-b.txt', '5.5.5.5#US#us-1\n');
+  const kv = new MockKV();
+  await kv.put('config', JSON.stringify({ iplist: 'https://example.com/list-b.txt' }));
+  const env = {
+    TOKEN: 'secret1', LINK: EDGE_NODE, EDGETUNNEL_HOSTS: 'edgetunnel.example.com',
+    OMNI_KV: kv,
+  };
+  const out = await subRaw(env, '');
+  assert(out.includes('@5.5.5.5:443'), 'online IP picked, got: ' + out.slice(0, 120));
+});
+
+await test('iplist: KV entries win over online entries for the same IP', async () => {
+  mockFetch('https://example.com/list-c.txt', '6.6.6.6#US\n7.7.7.7#US\n');
+  const kv = new MockKV();
+  await kv.put('ips', JSON.stringify([{ ip: '6.6.6.6', region: 'US', latency: 5, enabled: true }]));
+  await kv.put('config', JSON.stringify({ iplist: 'https://example.com/list-c.txt' }));
+  const env = {
+    TOKEN: 'secret1', LINK: EDGE_NODE, EDGETUNNEL_HOSTS: 'edgetunnel.example.com',
+    OMNI_KV: kv,
+  };
+  const out = await subRaw(env, '');
+  // KV 6.6.6.6 has latency 5, online 7.7.7.7 has none: KV wins either way,
+  // and the online duplicate of 6.6.6.6 must not shadow the KV entry.
+  assert(out.includes('@6.6.6.6:443'), 'KV entry wins, got: ' + out.slice(0, 120));
+  const r = await callJson(env, '/api/ips/online', { headers: { Authorization: 'Bearer secret1' } });
+  assertEq(r.json.total, 1, 'online list excludes the IP already in KV');
+  assertEq(r.json.ips[0].ip, '7.7.7.7', 'only the new online IP is listed');
+});
+
+await test('iplist: a failing list URL is skipped, not fatal', async () => {
+  mockFetch('https://example.com/list-d.txt', 'not found', 'text/plain');
+  fetchMocks.set('https://example.com/list-d.txt', { body: 'x', status: 404, contentType: 'text/plain' });
+  const kv = new MockKV();
+  await kv.put('config', JSON.stringify({ iplist: 'https://example.com/list-d.txt' }));
+  const env = {
+    TOKEN: 'secret1', LINK: EDGE_NODE, EDGETUNNEL_HOSTS: 'edgetunnel.example.com',
+    OMNI_KV: kv,
+  };
+  const out = await subRaw(env, '');
+  assert(out.includes('@edgetunnel.example.com:443'), 'no replacement when the list fails');
+});
+
+// ---------------------------------------------------------------------------
+// IP region auto-detection (/api/ips/detect)
+// ---------------------------------------------------------------------------
+
+function mockGeo(ip, countryCode, city, flagEmoji) {
+  mockFetch(`https://ipwho.is/${ip}`, JSON.stringify({
+    success: true, ip, country_code: countryCode, country: countryCode === 'US' ? 'United States' : 'Japan',
+    city, flag: { emoji: flagEmoji },
+  }), 'application/json');
+}
+
+await test('detect: one IP returns a formatted label', async () => {
+  mockGeo('104.21.0.1', 'US', 'Los Angeles', '🇺🇸');
+  const env = { TOKEN: 'secret1', OMNI_KV: new MockKV() };
+  const r = await callJson(env, '/api/ips/detect', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer secret1', 'content-type': 'application/json' },
+    body: JSON.stringify({ ip: '104.21.0.1' }),
+  });
+  assertEq(r.res.status, 200, 'detect status');
+  assertEq(r.json.total, 1, 'one detected');
+  assertEq(r.json.detected[0].label, '🇺🇸-US-LAX-01', 'label format flag-country-city-serial');
+  assertEq(r.json.detected[0].region, 'US', 'region is the country code');
+  assertEq(r.json.failed.length, 0, 'nothing failed');
+});
+
+await test('detect: serial numbers increment within the same city', async () => {
+  mockGeo('104.21.0.2', 'US', 'Los Angeles', '🇺🇸');
+  mockGeo('104.21.0.3', 'US', 'Los Angeles', '🇺🇸');
+  mockGeo('104.21.0.4', 'JP', 'Tokyo', '🇯🇵');
+  const kv = new MockKV();
+  await kv.put('ips', JSON.stringify([{ ip: '9.9.9.9', region: 'US', label: '🇺🇸-US-LAX-01', enabled: true }]));
+  const env = { TOKEN: 'secret1', OMNI_KV: kv };
+  const r = await callJson(env, '/api/ips/detect', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer secret1', 'content-type': 'application/json' },
+    body: JSON.stringify({ ips: ['104.21.0.2', '104.21.0.3', '104.21.0.4'] }),
+  });
+  assertEq(r.res.status, 200, 'detect status');
+  assertEq(r.json.total, 3, 'three detected');
+  assertEq(r.json.detected[0].label, '🇺🇸-US-LAX-02', 'second LA IP is -02 (one already in KV)');
+  assertEq(r.json.detected[1].label, '🇺🇸-US-LAX-03', 'third LA IP is -03');
+  assertEq(r.json.detected[2].label, '🇯🇵-JP-NRT-01', 'Tokyo starts at -01');
+});
+
+await test('detect: invalid IP and failed lookup are reported, not fatal', async () => {
+  const env = { TOKEN: 'secret1', OMNI_KV: new MockKV() };
+  const r = await callJson(env, '/api/ips/detect', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer secret1', 'content-type': 'application/json' },
+    body: JSON.stringify({ ips: ['not-an-ip', '203.0.113.99'] }),
+  });
+  assertEq(r.res.status, 200, 'detect status');
+  assertEq(r.json.total, 0, 'nothing detected');
+  assertEq(r.json.failed.length, 2, 'both reported as failed');
+  const bad = await callJson(env, '/api/ips/detect', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer secret1', 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  assertEq(bad.res.status, 400, 'empty body is 400');
+});
+
+// ---------------------------------------------------------------------------
+// Node naming with a detected label
+// ---------------------------------------------------------------------------
+
+await test('label: auto-picked labelled IP renames the node to its label', async () => {
+  const env = poolEnv([
+    { ip: '2.2.2.2', region: 'US', label: '🇺🇸-US-LAX-01', latency: 20, enabled: true },
+  ]);
+  const out = await subRaw(env, '');
+  assert(out.includes('@2.2.2.2:443'), 'labelled IP picked');
+  const decoded = decodeURIComponent(out);
+  assert(decoded.includes('🇺🇸-US-LAX-01'), 'node renamed to the label, got: ' + decoded.slice(-80));
+  assert(!decoded.includes('(优选)'), 'no (优选) suffix when a label is used');
+});
+
+await test('label: explicit ?ip= reuses the pool label when the IP is known', async () => {
+  const env = poolEnv([
+    { ip: '2.2.2.2', region: 'US', label: '🇺🇸-US-LAX-01', latency: 20, enabled: true },
+  ]);
+  const out = await subRaw(env, '&ip=2.2.2.2');
+  assert(out.includes('@2.2.2.2:443'), 'explicit ip applied');
+  assert(decodeURIComponent(out).includes('🇺🇸-US-LAX-01'), 'node renamed to the known label');
+});
+
+await test('label: unlabelled IP keeps the (优选) suffix', async () => {
+  const env = poolEnv([
+    { ip: '2.2.2.2', region: 'US', latency: 20, enabled: true },
+  ]);
+  const out = await subRaw(env, '');
+  assert(decodeURIComponent(out).includes('(优选)'), 'unlabelled IP keeps the suffix');
 });
 
 // ---------------------------------------------------------------------------

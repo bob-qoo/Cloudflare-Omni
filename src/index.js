@@ -1438,13 +1438,16 @@ function isEdgeTunnel(node, edgeHosts) {
  * - `ip` wins as the connect address when both ip and domain are given.
  * - The original domain is kept as the TLS SNI (set when missing) and as
  *   the Host header for ws / xhttp / httpupgrade / grpc transports.
- * - Renames the node with a "(优选)" suffix only when a replacement happened.
+ * - When the picked IP entry carries a `label` (e.g. an auto-detected
+ *   🇺🇸-US-LAX-01), the node is renamed to that label; otherwise the node
+ *   keeps its name with a "(优选)" suffix.
  */
-function applyPrefer(nodes, preferIp, preferDomain, edgeHosts) {
+function applyPrefer(nodes, preferIp, preferDomain, edgeHosts, preferLabel) {
   const ip = (preferIp || '').trim();
   const domain = (preferDomain || '').trim();
   if (!ip && !domain) return nodes;
   const target = ip || domain;
+  const label = (preferLabel || '').trim();
   const tlsProtocols = new Set([
     'vless', 'vmess', 'trojan', 'hysteria', 'hysteria2', 'tuic', 'anytls',
   ]);
@@ -1465,7 +1468,9 @@ function applyPrefer(nodes, preferIp, preferDomain, edgeHosts) {
     if (hostTransports.has(node.type) && !node.host) {
       setNodeField(node, 'host', originalDomain);
     }
-    if (!node.name.endsWith('(优选)')) {
+    if (label) {
+      node.name = label;
+    } else if (!node.name.endsWith('(优选)')) {
       node.name = `${node.name}(优选)`;
     }
   }
@@ -2046,12 +2051,35 @@ async function buildTokens(master) {
   return { all: new Set([master, fixed, daily]), master, fixed, daily };
 }
 
+/**
+ * Token carried in the URL path: /admin/<token> or /sub/<token>, or the
+ * token as the first path segment (/<token>). Returns the decoded token
+ * or ''. A token is any run of characters that are not URL-special
+ * (letters, digits, '-', '_', '.', '~'); anything else must be
+ * percent-encoded by the caller and is decoded here.
+ */
+function pathToken(url, prefix) {
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (prefix && parts.length >= 2 && parts[0] === prefix) {
+    try {
+      return decodeURIComponent(parts[1]);
+    } catch {
+      return parts[1] || '';
+    }
+  }
+  return '';
+}
+
 /** Accept ?token=... or a token as the first path segment (/<token>). */
 function isAuthorized(url, tokens) {
   const q = url.searchParams.get('token');
   if (q && tokens.all.has(q)) return true;
   const seg = url.pathname.split('/').filter(Boolean)[0];
   if (seg && tokens.all.has(decodeURIComponent(seg))) return true;
+  const subSeg = pathToken(url, 'sub');
+  if (subSeg && tokens.all.has(subSeg)) return true;
+  const adminSeg = pathToken(url, 'admin');
+  if (adminSeg && tokens.all.has(adminSeg)) return true;
   return false;
 }
 
@@ -2080,6 +2108,7 @@ const CONFIG_FIELDS = [
   { kv: 'preferIp', env: 'PREFER_IP' },
   { kv: 'preferDomain', env: 'PREFER_DOMAIN' },
   { kv: 'edgetunnelHosts', env: 'EDGETUNNEL_HOSTS' },
+  { kv: 'iplist', env: 'IPLIST' },
 ];
 
 /** Safe KV read: null when unbound, missing, or on error (never throws). */
@@ -2152,7 +2181,7 @@ function normalizeConfigValue(kvKey, kvVal, envVal) {
   if (v === undefined || v === null || v === '') v = envVal;
   if (v === undefined || v === null) v = '';
   if (Array.isArray(v)) {
-    v = (kvKey === 'link' || kvKey === 'linksub') ? v.join('\n') : v.join(',');
+    v = (kvKey === 'link' || kvKey === 'linksub' || kvKey === 'iplist') ? v.join('\n') : v.join(',');
   }
   return String(v);
 }
@@ -2270,14 +2299,15 @@ function dedupeIpList(list) {
 }
 
 /**
- * Pick the best IP from the pool: only enabled entries; prefer the given
- * region (falls back to any region when it has no entries); lowest latency
- * first, entries without latency last (stable order). Returns '' when empty.
+ * Pick the best IP entry from the pool: only enabled entries; prefer the
+ * given region (falls back to any region when it has no entries); lowest
+ * latency first, entries without latency last (stable order). Returns the
+ * entry object, or null when the pool is empty.
  */
-function pickPreferredIp(pool, region) {
-  if (!Array.isArray(pool) || pool.length === 0) return '';
+function pickPreferredIpEntry(pool, region) {
+  if (!Array.isArray(pool) || pool.length === 0) return null;
   const enabled = pool.filter((e) => e && e.ip && e.enabled !== false);
-  if (enabled.length === 0) return '';
+  if (enabled.length === 0) return null;
   const want = String(region || '').trim().toLowerCase();
   let candidates = enabled;
   if (want) {
@@ -2289,8 +2319,264 @@ function pickPreferredIp(pool, region) {
     const lb = typeof b.latency === 'number' ? b.latency : Infinity;
     return la - lb;
   });
-  return sorted[0].ip || '';
+  return sorted[0] || null;
 }
+
+/**
+ * Pick the best IP from the pool: only enabled entries; prefer the given
+ * region (falls back to any region when it has no entries); lowest latency
+ * first, entries without latency last (stable order). Returns '' when empty.
+ */
+function pickPreferredIp(pool, region) {
+  const entry = pickPreferredIpEntry(pool, region);
+  return entry ? entry.ip || '' : '';
+}
+
+// --- Online IP lists (IPLIST) ----------------------------------------------
+
+/** Cache TTL for a fetched online IP list, in seconds (1 hour). */
+const IPLIST_CACHE_TTL = 3600;
+
+/**
+ * Fetch one online IP list URL and parse it. Each line is `ip`,
+ * `ip#region` or `ip#region#label` (same as the bulk-import format).
+ * Results are cached in the Cache API for IPLIST_CACHE_TTL so a
+ * subscription request does not refetch the list every time. Returns an
+ * array of entries (each with a `source` field = the list URL), or [] on
+ * any failure. Never throws.
+ */
+async function fetchOnlineIpList(listUrl) {
+  const url = String(listUrl || '').trim();
+  if (!url) return [];
+  const cacheKey = new Request(`https://omni.local/iplist?url=${encodeURIComponent(url)}`, { method: 'GET' });
+  try {
+    const cached = await caches.default.match(cacheKey);
+    if (cached) {
+      const text = await cached.text();
+      return parseIpImportText(text)
+        .map((e) => normalizeIpEntry(e, null))
+        .filter(Boolean)
+        .map((e) => ({ ...e, source: url }));
+    }
+  } catch {
+    // Cache unavailable: fall through to a live fetch.
+  }
+  let text = '';
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { signal: ctrl.signal, headers: { 'user-agent': 'Cloudflare-Omni' } });
+      if (!res.ok) return [];
+      text = await res.text();
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return [];
+  }
+  try {
+    const res = new Response(text, { headers: { 'cache-control': `public, max-age=${IPLIST_CACHE_TTL}` } });
+    await caches.default.put(cacheKey, res.clone());
+  } catch {
+    // Caching is best-effort; the parsed list is still usable.
+  }
+  return parseIpImportText(text)
+    .map((e) => normalizeIpEntry(e, null))
+    .filter(Boolean)
+    .map((e) => ({ ...e, source: url }));
+}
+
+/**
+ * Load every online IP list named by cfg.IPLIST (one URL per line) and
+ * merge the entries. KV entries win over online entries for the same IP.
+ * Returns the merged, deduped pool. Never throws.
+ */
+async function loadOnlineIps(cfg, kvPool) {
+  const urls = splitLines(cfg.IPLIST || '');
+  if (urls.length === 0) return [];
+  const lists = await Promise.all(urls.map((u) => fetchOnlineIpList(u)));
+  const online = lists.flat();
+  const kvIps = new Set((kvPool || []).map((e) => String(e.ip || '').toLowerCase()));
+  return dedupeIpList(online.filter((e) => e && e.ip && !kvIps.has(String(e.ip).toLowerCase())));
+}
+
+/**
+ * The full preferred-IP candidate pool: KV library entries first, then
+ * online-list entries (KV wins on duplicate IPs). Never throws.
+ */
+async function loadPreferredIpPool(env, cfg) {
+  const kvPool = await loadKvIps(env);
+  let online = [];
+  try {
+    online = await loadOnlineIps(cfg, kvPool);
+  } catch {
+    online = [];
+  }
+  return dedupeIpList([...kvPool, ...online]);
+}
+
+// --- IP geolocation (auto region detection) --------------------------------
+
+/**
+ * Free geolocation providers, tried in order until one answers. Each
+ * entry normalises its provider's JSON to
+ * { countryCode, country, city, flag }. Cloudflare's egress IPs are
+ * blocked by some free geo services, so a single provider is not
+ * reliable enough on its own.
+ */
+const GEO_PROVIDERS = [
+  {
+    name: 'ipwho.is',
+    url: (ip) => `https://ipwho.is/${encodeURIComponent(ip)}`,
+    parse: (d) => {
+      if (!d || d.success === false) return null;
+      const countryCode = String(d.country_code || '').trim().toUpperCase();
+      const city = String(d.city || '').trim();
+      if (!countryCode || !city) return null;
+      const flag = (d.flag && d.flag.emoji) ? String(d.flag.emoji) : flagEmoji(countryCode);
+      return { countryCode, country: String(d.country || '').trim(), city, flag };
+    },
+  },
+  {
+    name: 'ipapi.co',
+    url: (ip) => `https://ipapi.co/${encodeURIComponent(ip)}/json/`,
+    parse: (d) => {
+      if (!d || d.error) return null;
+      const countryCode = String(d.country_code || '').trim().toUpperCase();
+      const city = String(d.city || '').trim();
+      if (!countryCode || !city) return null;
+      return { countryCode, country: String(d.country_name || '').trim(), city, flag: flagEmoji(countryCode) };
+    },
+  },
+  {
+    name: 'ipinfo.io',
+    url: (ip) => `https://ipinfo.io/${encodeURIComponent(ip)}/json`,
+    parse: (d) => {
+      if (!d || d.bogon) return null;
+      const countryCode = String(d.country || '').trim().toUpperCase();
+      const city = String(d.city || '').trim();
+      if (!countryCode || !city) return null;
+      return { countryCode, country: '', city, flag: flagEmoji(countryCode) };
+    },
+  },
+];
+
+/**
+ * Look up one IP's location, trying each free provider in turn. Returns
+ * { countryCode, country, city, flag } or null when every provider fails.
+ * Never throws.
+ */
+async function geoLookupIp(ip) {
+  if (!isValidIp(ip)) return null;
+  for (const provider of GEO_PROVIDERS) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+      let data = null;
+      try {
+        const res = await fetch(provider.url(ip), {
+          signal: ctrl.signal,
+          headers: { 'user-agent': 'Cloudflare-Omni' },
+        });
+        if (!res.ok) continue;
+        data = await res.json();
+      } finally {
+        clearTimeout(timer);
+      }
+      const geo = provider.parse(data);
+      if (geo) return geo;
+    } catch {
+      // Try the next provider.
+    }
+  }
+  return null;
+}
+
+/** Flag emoji for a 2-letter country code (regional indicator symbols). */
+function flagEmoji(countryCode) {
+  const code = String(countryCode || '').trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(code)) return '';
+  return [...code].map((ch) => String.fromCodePoint(0x1f1e6 + (ch.charCodeAt(0) - 65))).join('');
+}
+
+/** Common city name -> short code (IATA-style) for compact labels. */
+const CITY_CODE_MAP = {
+  'los angeles': 'LAX', 'san francisco': 'SFO', 'san jose': 'SJC',
+  'seattle': 'SEA', 'chicago': 'ORD', 'new york': 'JFK',
+  'new york city': 'JFK', 'ashburn': 'IAD', 'miami': 'MIA',
+  'dallas': 'DFW', 'atlanta': 'ATL', 'denver': 'DEN',
+  'boston': 'BOS', 'houston': 'IAH', 'phoenix': 'PHX',
+  'portland': 'PDX', 'london': 'LHR', 'frankfurt': 'FRA',
+  'paris': 'CDG', 'amsterdam': 'AMS', 'singapore': 'SIN',
+  'tokyo': 'NRT', 'hong kong': 'HKG', 'seoul': 'ICN',
+  'sydney': 'SYD', 'toronto': 'YYZ', 'vancouver': 'YVR',
+  'osaka': 'KIX', 'taipei': 'TPE', 'mumbai': 'BOM',
+  'sao paulo': 'GRU', 'johannesburg': 'JNB', 'dubai': 'DXB',
+};
+
+/**
+ * Short city code for a label: a known IATA-style code when the city is
+ * recognised, otherwise the city name uppercased, spaces removed, capped
+ * at 10 characters.
+ */
+function cityCode(city) {
+  const name = String(city || '').trim();
+  const mapped = CITY_CODE_MAP[name.toLowerCase()];
+  if (mapped) return mapped;
+  const clean = name.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  return clean.slice(0, 10) || 'UNK';
+}
+
+/**
+ * Format an IP label as [flag]-[country]-[city]-[serial], e.g.
+ * 🇺🇸-US-LAX-01. `serial` is the 1-based index within the same
+ * country+city group and is rendered as two digits.
+ */
+function formatIpLabel(geo, serial) {
+  const n = Math.max(1, Number(serial) || 1);
+  return `${geo.flag}-${geo.countryCode}-${cityCode(geo.city)}-${String(n).padStart(2, '0')}`;
+}
+
+/**
+ * Detect the location of each IP and build its label. `existing` is the
+ * current IP library (used to number serials after the entries already
+ * using the same country+city). Returns an array of
+ * { ip, countryCode, country, city, flag, region, label } in input order;
+ * entries that fail detection are omitted. Never throws.
+ */
+async function detectIpLabels(ips, existing) {
+  const counts = new Map();
+  for (const e of existing || []) {
+    const label = String(e.label || '');
+    const m = /^([^\s-]+)-([A-Z]{2})-([A-Z0-9]+)-(\d{2})$/.exec(label);
+    if (m) {
+      const key = `${m[2]}|${m[3]}`;
+      counts.set(key, Math.max(counts.get(key) || 0, parseInt(m[4], 10)));
+    }
+  }
+  const out = [];
+  for (const rawIp of ips || []) {
+    const ip = String(rawIp || '').trim();
+    if (!isValidIp(ip)) continue;
+    const geo = await geoLookupIp(ip);
+    if (!geo) continue;
+    const key = `${geo.countryCode}|${cityCode(geo.city)}`;
+    const serial = (counts.get(key) || 0) + 1;
+    counts.set(key, serial);
+    out.push({
+      ip,
+      countryCode: geo.countryCode,
+      country: geo.country,
+      city: geo.city,
+      flag: geo.flag,
+      region: geo.countryCode,
+      label: formatIpLabel(geo, serial),
+    });
+  }
+  return out;
+}
+
 
 /**
  * Parse bulk-import text: one IP per line, `ip`, `ip#region` or
@@ -2316,7 +2602,7 @@ function parseIpImportText(text) {
 const CONFIG_FIELD_TYPES = {
   token: 'string', link: 'string', linksub: 'string', subapi: 'string',
   subname: 'string', subuptime: 'int', preferIp: 'string',
-  preferDomain: 'string', edgetunnelHosts: 'string',
+  preferDomain: 'string', edgetunnelHosts: 'string', iplist: 'string',
 };
 
 function validateConfigPatch(body) {
@@ -2355,9 +2641,15 @@ function jsonResponse(obj, status = 200, extraHeaders = {}) {
   });
 }
 
-/** Master token from the request: ?token= query param or Bearer header. */
+/**
+ * Master token from the request: /admin/<token> path segment, ?token=
+ * query param, or Bearer header. The path form is preferred for the
+ * admin page so the token never appears in a query string.
+ */
 function adminTokenFromRequest(request) {
   const url = new URL(request.url);
+  const seg = pathToken(url, 'admin');
+  if (seg) return seg;
   const q = url.searchParams.get('token');
   if (q) return q;
   const auth = request.headers.get('Authorization') || '';
@@ -2380,15 +2672,26 @@ function adminForbiddenHtml(message) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Cloudflare-Omni 管理</title>
-<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:560px;margin:48px auto;padding:0 20px;line-height:1.6;color:#222}input{padding:8px;width:280px}button{padding:8px 14px;cursor:pointer}</style>
+<style>${PAGE_CSS}</style>
 </head>
 <body>
 <h1>Cloudflare-Omni 管理</h1>
-<p>${escapeHtml(message)}</p>
-<p>在下方输入主口令 TOKEN 后打开管理页：</p>
-<p><input id="t" type="password" placeholder="主口令 TOKEN"> <button onclick="location.href='/admin?token='+encodeURIComponent(document.getElementById('t').value)">打开管理页</button></p>
-<p>管理接口仅接受主口令，访客 token 不可用。</p>
+<p role="status">${escapeHtml(message)}</p>
+<form id="tokenForm" action="/admin" method="get">
+<label for="t">主口令 TOKEN</label>
+<input id="t" name="token" type="password" placeholder="主口令 TOKEN" autocomplete="current-password" required>
+<button class="primary" type="submit">打开管理页</button>
+</form>
+<p class="hint">也可以直接访问 <code>/admin/你的主口令</code>。管理接口仅接受主口令，访客 token 不可用。</p>
+<script>
+document.getElementById('tokenForm').addEventListener('submit', function (ev) {
+  ev.preventDefault();
+  var t = document.getElementById('t').value.trim();
+  if (t) location.href = '/admin/' + encodeURIComponent(t);
+});
+</script>
 </body>
 </html>`;
 }
@@ -2399,82 +2702,101 @@ function adminPageHtml() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Cloudflare-Omni 管理</title>
-<style>
-body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:860px;margin:32px auto;padding:0 20px;line-height:1.6;color:#222}
-h1{font-size:22px}h2{font-size:18px;margin-top:32px;border-bottom:1px solid #ddd;padding-bottom:4px}
-label{display:block;margin:8px 0;font-size:14px}
-input[type=text],input[type=password],input[type=number],textarea{width:100%;padding:7px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;font-size:14px}
-textarea{font-family:ui-monospace,Menlo,monospace}
-button{padding:7px 14px;margin:6px 6px 6px 0;cursor:pointer;border:1px solid #999;background:#fff;border-radius:4px}
-button.primary{background:#222;color:#fff;border-color:#222}
-table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}
-th,td{border:1px solid #ddd;padding:6px 8px;text-align:left}
-th{background:#f5f5f5}
-td input{width:100%;padding:4px;box-sizing:border-box}
-#msg{padding:10px;border-radius:4px;margin:12px 0;display:none}
-#msg.ok{display:block;background:#e6f4ea;color:#137333}
-#msg.err{display:block;background:#fce8e6;color:#a50e0e}
-.hint{color:#666;font-size:13px}
-.row{display:flex;gap:12px}.row>div{flex:1}
-</style>
+<style>${PAGE_CSS}</style>
 </head>
 <body>
 <h1>Cloudflare-Omni 管理</h1>
-<div id="msg"></div>
+<div id="msg" role="status" aria-live="polite"></div>
 
 <h2>访问口令</h2>
-<label>主口令 TOKEN <input id="token" type="password" placeholder="主口令（仅用于调用管理接口，不会保存到页面外）"></label>
-<button id="loadBtn">加载配置与 IP 库</button>
-<span class="hint">地址栏带 ?token= 时自动填入。</span>
+<label for="token">主口令 TOKEN</label>
+<input id="token" type="password" placeholder="主口令（仅用于调用管理接口，不会保存到页面外）" autocomplete="current-password">
+<button id="loadBtn" type="button">加载配置与 IP 库</button>
+<span class="hint">地址栏是 /admin/你的主口令 时自动填入。</span>
 
 <h2>配置</h2>
-<p class="hint">保存后写入 KV，优先级：请求参数 &gt; KV 配置 &gt; 环境变量。留空表示沿用环境变量。token 字段显示为掩码，留空表示不修改。</p>
-<form id="cfgForm">
-<label>主口令 token <input id="c_token" type="password" placeholder="********（留空不修改）" autocomplete="off"></label>
-<label>节点与订阅链接 link（每行一个）<textarea id="c_link" rows="4"></textarea></label>
-<label>额外订阅链接 linksub（每行一个）<textarea id="c_linksub" rows="2"></textarea></label>
+<p class="hint" id="cfgHint">保存后写入 KV，优先级：请求参数 &gt; KV 配置 &gt; 环境变量。留空表示沿用环境变量。token 字段显示为掩码，留空表示不修改。</p>
+<form id="cfgForm" aria-describedby="cfgHint">
+<fieldset>
+<legend>订阅与转换</legend>
+<label for="c_token">主口令 token</label>
+<input id="c_token" type="password" placeholder="********（留空不修改）" autocomplete="off">
+<label for="c_link">节点与订阅链接 link（每行一个）</label>
+<textarea id="c_link" rows="4"></textarea>
+<label for="c_linksub">额外订阅链接 linksub（每行一个）</label>
+<textarea id="c_linksub" rows="2"></textarea>
 <div class="row">
-<div><label>转换后端 subapi <input id="c_subapi" type="text"></label></div>
-<div><label>订阅名 subname <input id="c_subname" type="text"></label></div>
-<div><label>缓存小时 subuptime（1-168） <input id="c_subuptime" type="number" min="1" max="168"></label></div>
+<div><label for="c_subapi">转换后端 subapi</label><input id="c_subapi" type="text"></div>
+<div><label for="c_subname">订阅名 subname</label><input id="c_subname" type="text"></div>
+<div><label for="c_subuptime">缓存小时 subuptime（1-168）</label><input id="c_subuptime" type="number" min="1" max="168"></div>
 </div>
+</fieldset>
+<fieldset>
+<legend>优选</legend>
 <div class="row">
-<div><label>优选 IP preferIp <input id="c_preferIp" type="text" placeholder="1.2.3.4，多个用逗号分隔"></label></div>
-<div><label>优选域名 preferDomain <input id="c_preferDomain" type="text"></label></div>
+<div><label for="c_preferIp">优选 IP preferIp</label><input id="c_preferIp" type="text" placeholder="1.2.3.4，多个用逗号分隔"></div>
+<div><label for="c_preferDomain">优选域名 preferDomain</label><input id="c_preferDomain" type="text"></div>
 </div>
-<label>edgeTunnel 域名 edgetunnelHosts（逗号分隔）<input id="c_edgetunnelHosts" type="text"></label>
+<label for="c_edgetunnelHosts">edgeTunnel 域名 edgetunnelHosts（逗号分隔）</label>
+<input id="c_edgetunnelHosts" type="text">
+<label for="c_iplist">在线优选 IP 列表 iplist（每行一个 .txt 地址）</label>
+<textarea id="c_iplist" rows="2" placeholder="https://raw.githubusercontent.com/xxx/ips.txt"></textarea>
+<p class="hint" id="iplistHint">每个地址返回一个 .txt，每行一个 IP，格式 ip 或 ip#region 或 ip#region#label。列表每小时拉取一次缓存，自动并入优选候选池（KV 库优先）。</p>
+</fieldset>
 <button class="primary" type="submit">保存配置</button>
 </form>
 
-<h2>IP 库（edgeTunnel 优选候选池）</h2>
-<p class="hint">未给 ?ip= 且未配 PREFER_IP 时，edgeTunnel 节点自动从这里挑选：优先 ?region= 指定的地区、仅 enabled、延迟最小者优先。</p>
+<h2 id="ipHeading">IP 库（edgeTunnel 优选候选池）</h2>
+<p class="hint">未给 ?ip= 且未配 PREFER_IP 时，edgeTunnel 节点自动从这里挑选：优先 ?region= 指定的地区、仅 enabled、延迟最小者优先。带标签的 IP 被选中后，节点名会换成标签（如 🇺🇸-US-LAX-01）。</p>
+<div tabindex="0" role="region" aria-labelledby="ipHeading" class="table-wrapper">
 <table id="ipTable">
-<thead><tr><th>IP</th><th>地区</th><th>备注</th><th>延迟(ms)</th><th>启用</th><th>操作</th></tr></thead>
+<caption id="ipTableCaption">KV 中的优选 IP</caption>
+<thead><tr><th scope="col">IP</th><th scope="col">地区</th><th scope="col">备注</th><th scope="col">延迟(ms)</th><th scope="col">启用</th><th scope="col">操作</th></tr></thead>
 <tbody id="ipBody"></tbody>
 </table>
+</div>
+<button id="detectAllBtn" type="button">一键识别全部未标注 IP</button>
 <h3>新增 / 编辑</h3>
 <form id="ipForm">
 <div class="row">
-<div><label>IP <input id="f_ip" type="text" required placeholder="1.2.3.4 或 IPv6"></label></div>
-<div><label>地区 region <input id="f_region" type="text" placeholder="HK / US / JP"></label></div>
-<div><label>备注 label <input id="f_label" type="text"></label></div>
-<div><label>延迟 latency(ms) <input id="f_latency" type="number" min="0"></label></div>
-<div><label>启用 enabled <input id="f_enabled" type="checkbox" checked></label></div>
+<div><label for="f_ip">IP</label><input id="f_ip" type="text" required placeholder="1.2.3.4 或 IPv6" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false"></div>
+<div><label for="f_region">地区 region</label><input id="f_region" type="text" placeholder="HK / US / JP" autocomplete="off"></div>
+<div><label for="f_label">备注 label</label><input id="f_label" type="text" placeholder="🇺🇸-US-LAX-01"></div>
+<div><label for="f_latency">延迟 latency(ms)</label><input id="f_latency" type="number" min="0"></div>
+<div><label for="f_enabled">启用 enabled</label><input id="f_enabled" type="checkbox" checked></div>
 </div>
 <button class="primary" type="submit">保存该条</button>
+<button type="button" id="ipDetectBtn">识别该 IP 归属地</button>
 <button type="button" id="ipClear">清空表单</button>
 </form>
 <h3>批量导入</h3>
+<label for="importText">导入文本</label>
 <textarea id="importText" rows="6" placeholder="每行一个 IP，格式：ip 或 ip#region 或 ip#region#label"></textarea><br>
-<button id="importBtn">导入</button>
-<button id="exportBtn">导出 JSON</button>
+<button id="importBtn" type="button">导入</button>
+<button id="exportBtn" type="button">导出 JSON</button>
+
+<h2 id="onlineHeading">在线 IP 列表（IPLIST）</h2>
+<p class="hint">配置的在线列表拉取结果（只读，不存 KV）。来源地址与识别出的标签一并显示。</p>
+<button id="onlineLoadBtn" type="button">刷新在线列表</button>
+<div tabindex="0" role="region" aria-labelledby="onlineHeading" class="table-wrapper">
+<table id="onlineTable">
+<caption id="onlineTableCaption">在线列表中的优选 IP</caption>
+<thead><tr><th scope="col">IP</th><th scope="col">地区</th><th scope="col">备注</th><th scope="col">来源</th></tr></thead>
+<tbody id="onlineBody"></tbody>
+</table>
+</div>
 
 <script>
 var tokenInput = document.getElementById('token');
 var msgBox = document.getElementById('msg');
-var qs = new URLSearchParams(location.search);
-if (qs.get('token')) tokenInput.value = qs.get('token');
+(function () {
+  var m = location.pathname.match(/^\\/admin\\/([^/]+)/);
+  if (m) { tokenInput.value = decodeURIComponent(m[1]); return; }
+  var qs = new URLSearchParams(location.search);
+  if (qs.get('token')) tokenInput.value = qs.get('token');
+})();
 
 function showMsg(text, ok) {
   msgBox.textContent = text;
@@ -2484,8 +2806,8 @@ function token() { return tokenInput.value.trim(); }
 function api(path, opts) {
   opts = opts || {};
   opts.headers = opts.headers || {};
-  var sep = path.indexOf('?') >= 0 ? '&' : '?';
-  return fetch(path + sep + 'token=' + encodeURIComponent(token()), opts);
+  opts.headers['Authorization'] = 'Bearer ' + token();
+  return fetch(path, opts);
 }
 function loadAll() {
   if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
@@ -2501,9 +2823,11 @@ function loadAll() {
     document.getElementById('c_preferIp').value = c.preferIp || '';
     document.getElementById('c_preferDomain').value = c.preferDomain || '';
     document.getElementById('c_edgetunnelHosts').value = c.edgetunnelHosts || '';
+    document.getElementById('c_iplist').value = c.iplist || '';
     showMsg('配置已加载。', true);
   }).catch(function (e) { showMsg('加载配置失败：' + e.message, false); });
   loadIps();
+  loadOnlineIps();
 }
 function loadIps() {
   api('/api/ips').then(function (r) { return r.json(); }).then(function (d) {
@@ -2511,18 +2835,41 @@ function loadIps() {
     renderIps(d.ips || []);
   }).catch(function (e) { showMsg('加载 IP 库失败：' + e.message, false); });
 }
+function loadOnlineIps() {
+  api('/api/ips/online').then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { renderOnline([]); return; }
+    renderOnline(d.ips || []);
+  }).catch(function () { renderOnline([]); });
+}
+function renderOnline(list) {
+  var body = document.getElementById('onlineBody');
+  body.innerHTML = '';
+  list.forEach(function (e) {
+    var tr = document.createElement('tr');
+    var tdIp = document.createElement('td'); tdIp.textContent = e.ip; tdIp.setAttribute('data-label', 'IP'); tr.appendChild(tdIp);
+    var tdR = document.createElement('td'); tdR.textContent = e.region || ''; tdR.setAttribute('data-label', '地区'); tr.appendChild(tdR);
+    var tdL = document.createElement('td'); tdL.textContent = e.label || ''; tdL.setAttribute('data-label', '备注'); tr.appendChild(tdL);
+    var tdS = document.createElement('td'); tdS.textContent = e.source || ''; tdS.setAttribute('data-label', '来源'); tr.appendChild(tdS);
+    body.appendChild(tr);
+  });
+  if (list.length === 0) {
+    var tr0 = document.createElement('tr');
+    var td0 = document.createElement('td'); td0.colSpan = 4; td0.textContent = '没有配置在线列表，或列表为空。'; tr0.appendChild(td0);
+    body.appendChild(tr0);
+  }
+}
 function renderIps(list) {
   var body = document.getElementById('ipBody');
   body.innerHTML = '';
   list.forEach(function (e) {
     var tr = document.createElement('tr');
-    var tdIp = document.createElement('td'); tdIp.textContent = e.ip; tr.appendChild(tdIp);
-    var tdR = document.createElement('td'); tdR.textContent = e.region || ''; tr.appendChild(tdR);
-    var tdL = document.createElement('td'); tdL.textContent = e.label || ''; tr.appendChild(tdL);
-    var tdLat = document.createElement('td'); tdLat.textContent = (e.latency === null || e.latency === undefined) ? '' : e.latency; tr.appendChild(tdLat);
-    var tdE = document.createElement('td'); tdE.textContent = e.enabled === false ? '否' : '是'; tr.appendChild(tdE);
-    var tdA = document.createElement('td');
-    var bEdit = document.createElement('button'); bEdit.textContent = '编辑';
+    var tdIp = document.createElement('td'); tdIp.textContent = e.ip; tdIp.setAttribute('data-label', 'IP'); tr.appendChild(tdIp);
+    var tdR = document.createElement('td'); tdR.textContent = e.region || ''; tdR.setAttribute('data-label', '地区'); tr.appendChild(tdR);
+    var tdL = document.createElement('td'); tdL.textContent = e.label || ''; tdL.setAttribute('data-label', '备注'); tr.appendChild(tdL);
+    var tdLat = document.createElement('td'); tdLat.textContent = (e.latency === null || e.latency === undefined) ? '' : e.latency; tdLat.setAttribute('data-label', '延迟(ms)'); tr.appendChild(tdLat);
+    var tdE = document.createElement('td'); tdE.textContent = e.enabled === false ? '否' : '是'; tdE.setAttribute('data-label', '启用'); tr.appendChild(tdE);
+    var tdA = document.createElement('td'); tdA.setAttribute('data-label', '操作');
+    var bEdit = document.createElement('button'); bEdit.type = 'button'; bEdit.textContent = '编辑';
     bEdit.onclick = function () {
       document.getElementById('f_ip').value = e.ip;
       document.getElementById('f_region').value = e.region || '';
@@ -2531,7 +2878,9 @@ function renderIps(list) {
       document.getElementById('f_enabled').checked = e.enabled !== false;
       window.scrollTo(0, document.getElementById('ipForm').offsetTop);
     };
-    var bDel = document.createElement('button'); bDel.textContent = '删除';
+    var bDetect = document.createElement('button'); bDetect.type = 'button'; bDetect.textContent = '识别';
+    bDetect.onclick = function () { detectOne(e.ip); };
+    var bDel = document.createElement('button'); bDel.type = 'button'; bDel.textContent = '删除';
     bDel.onclick = function () {
       if (!confirm('删除 ' + e.ip + '？')) return;
       api('/api/ips?ip=' + encodeURIComponent(e.ip), { method: 'DELETE' }).then(function (r) { return r.json(); }).then(function (d) {
@@ -2539,7 +2888,7 @@ function renderIps(list) {
         showMsg('已删除 ' + e.ip + '。', true); loadIps();
       }).catch(function (err) { showMsg('删除失败：' + err.message, false); });
     };
-    tdA.appendChild(bEdit); tdA.appendChild(bDel); tr.appendChild(tdA);
+    tdA.appendChild(bEdit); tdA.appendChild(bDetect); tdA.appendChild(bDel); tr.appendChild(tdA);
     body.appendChild(tr);
   });
   if (list.length === 0) {
@@ -2548,7 +2897,42 @@ function renderIps(list) {
     body.appendChild(tr0);
   }
 }
+function detectOne(ip) {
+  if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
+  api('/api/ips/detect', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ip: ip }) }).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok || !d.detected || d.detected.length === 0) { showMsg('识别失败：' + (d.message || d.error || '查不到归属地'), false); return; }
+    var det = d.detected[0];
+    applyDetection(det);
+    showMsg('已识别 ' + ip + ' 为 ' + det.label + '。', true);
+  }).catch(function (e) { showMsg('识别失败：' + e.message, false); });
+}
+function applyDetection(det) {
+  return api('/api/ips', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ip: det.ip, region: det.region, label: det.label }) }).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { showMsg('保存标签失败：' + (d.message || d.error), false); return; }
+    loadIps();
+  }).catch(function (e) { showMsg('保存标签失败：' + e.message, false); });
+}
+document.getElementById('detectAllBtn').onclick = function () {
+  if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
+  api('/api/ips').then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { showMsg('加载 IP 库失败：' + (d.message || d.error), false); return; }
+    var ips = (d.ips || []).filter(function (e) { return !e.label; }).map(function (e) { return e.ip; });
+    if (ips.length === 0) { showMsg('没有未标注的 IP。', true); return; }
+    return api('/api/ips/detect', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ips: ips }) }).then(function (r) { return r.json(); }).then(function (dd) {
+      if (!dd.ok) { showMsg('识别失败：' + (dd.message || dd.error), false); return; }
+      var jobs = (dd.detected || []).map(function (det) { return applyDetection(det); });
+      return Promise.all(jobs).then(function () {
+        showMsg('识别完成：' + (dd.detected || []).length + ' 条已标注' + ((dd.failed || []).length ? '，' + dd.failed.length + ' 条失败' : '') + '。', true);
+      });
+    });
+  }).catch(function (e) { showMsg('识别失败：' + e.message, false); });
+};
 document.getElementById('loadBtn').onclick = loadAll;
+document.getElementById('onlineLoadBtn').onclick = function () {
+  if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
+  loadOnlineIps();
+  showMsg('在线列表已刷新。', true);
+};
 document.getElementById('cfgForm').onsubmit = function (ev) {
   ev.preventDefault();
   if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
@@ -2564,6 +2948,7 @@ document.getElementById('cfgForm').onsubmit = function (ev) {
   body.preferIp = document.getElementById('c_preferIp').value;
   body.preferDomain = document.getElementById('c_preferDomain').value;
   body.edgetunnelHosts = document.getElementById('c_edgetunnelHosts').value;
+  body.iplist = document.getElementById('c_iplist').value;
   api('/api/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(function (r) { return r.json(); }).then(function (d) {
     if (!d.ok) { showMsg('保存失败：' + (d.message || d.error), false); return; }
     showMsg('配置已保存。', true);
@@ -2584,6 +2969,18 @@ document.getElementById('ipForm').onsubmit = function (ev) {
     if (!d.ok) { showMsg('保存失败：' + (d.message || d.error), false); return; }
     showMsg('已保存 ' + body.ip + '。', true); loadIps();
   }).catch(function (e) { showMsg('保存失败：' + e.message, false); });
+};
+document.getElementById('ipDetectBtn').onclick = function () {
+  var ip = document.getElementById('f_ip').value.trim();
+  if (!ip) { showMsg('请先填写 IP。', false); return; }
+  if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
+  api('/api/ips/detect', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ip: ip }) }).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok || !d.detected || d.detected.length === 0) { showMsg('识别失败：' + (d.message || d.error || '查不到归属地'), false); return; }
+    var det = d.detected[0];
+    document.getElementById('f_region').value = det.region || '';
+    document.getElementById('f_label').value = det.label || '';
+    showMsg('已识别 ' + ip + ' 为 ' + det.label + '，已填入表单，点“保存该条”写入 IP 库。', true);
+  }).catch(function (e) { showMsg('识别失败：' + e.message, false); });
 };
 document.getElementById('ipClear').onclick = function () {
   document.getElementById('f_ip').value = '';
@@ -2643,7 +3040,7 @@ async function handleAdmin(request, env, cfg) {
     return deny(403, 'FORBIDDEN', '管理接口需要主口令 TOKEN（?token= 或 Authorization: Bearer）。访客 token 不可用。');
   }
 
-  if (url.pathname === '/admin') {
+  if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
     return new Response(adminPageHtml(), {
       headers: { 'content-type': 'text/html; charset=utf-8' },
     });
@@ -2668,6 +3065,12 @@ async function handleAdmin(request, env, cfg) {
   }
   if (url.pathname === '/api/ips/import' && request.method === 'POST') {
     return await handleApiIpsImport(request, env);
+  }
+  if (url.pathname === '/api/ips/detect' && request.method === 'POST') {
+    return await handleApiIpsDetect(request, env);
+  }
+  if (url.pathname === '/api/ips/online' && request.method === 'GET') {
+    return await handleApiIpsOnline(request, env, cfg);
   }
   return jsonResponse({ ok: false, error: 'NOT_FOUND', message: '未知的管理接口。' }, 404);
 }
@@ -2798,6 +3201,54 @@ async function handleApiIpsImport(request, env) {
   return jsonResponse({ ok: true, added, skipped, invalid, total: pool.length });
 }
 
+/**
+ * POST /api/ips/detect — one-click IP region detection.
+ * Body: {"ip": "1.2.3.4"} or {"ips": ["1.2.3.4", ...]}.
+ * Looks each IP up (ipwho.is) and returns its detected label in the form
+ * [flag]-[country]-[city]-[serial], e.g. 🇺🇸-US-LAX-01, plus the region
+ * (country code) to store on the entry. Entries that fail detection are
+ * reported in `failed` and omitted from `detected`. Nothing is saved
+ * here; the caller stores the label with PUT /api/ips.
+ */
+async function handleApiIpsDetect(request, env) {
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) return jsonResponse({ ok: false, error: 'BAD_JSON', message: parsed.error }, 400);
+  const body = parsed.body || {};
+  let ips = [];
+  if (typeof body.ip === 'string' && body.ip.trim()) ips = [body.ip.trim()];
+  else if (Array.isArray(body.ips)) ips = body.ips.map((x) => String(x || '').trim()).filter(Boolean);
+  if (ips.length === 0) {
+    return jsonResponse({ ok: false, error: 'VALIDATION_FAILED', message: '请求体须含 ip（字符串）或 ips（字符串数组）。' }, 400);
+  }
+  if (ips.length > 100) {
+    return jsonResponse({ ok: false, error: 'VALIDATION_FAILED', message: '一次最多识别 100 个 IP。' }, 400);
+  }
+  const pool = await loadKvIps(env);
+  const detected = await detectIpLabels(ips, pool);
+  const okIps = new Set(detected.map((d) => d.ip.toLowerCase()));
+  const failed = ips.filter((ip) => !okIps.has(ip.toLowerCase()));
+  return jsonResponse({ ok: true, detected, failed, total: detected.length });
+}
+
+/**
+ * GET /api/ips/online — the IPs currently contributed by the IPLIST
+ * online lists (fetched live, cached 1h), each with its `source` URL.
+ * Query params: ?region= and ?enabled= filter the same way as /api/ips.
+ * These entries are not stored in KV; the KV library is returned by
+ * /api/ips instead.
+ */
+async function handleApiIpsOnline(request, env, cfg) {
+  const url = new URL(request.url);
+  const region = (url.searchParams.get('region') || '').trim().toLowerCase();
+  const enabledParam = url.searchParams.get('enabled');
+  const kvPool = await loadKvIps(env);
+  let list = await loadOnlineIps(cfg, kvPool);
+  if (region) list = list.filter((e) => String(e.region || '').toLowerCase() === region);
+  if (enabledParam === '1') list = list.filter((e) => e.enabled !== false);
+  if (enabledParam === '0') list = list.filter((e) => e.enabled === false);
+  return jsonResponse({ ok: true, ips: list, total: list.length, kvBound: !!env?.OMNI_KV });
+}
+
 // ---------------------------------------------------------------------------
 // Aggregation pipeline (aggregate -> dedupe -> prefer)
 // ---------------------------------------------------------------------------
@@ -2860,6 +3311,84 @@ function cacheRequestFor(request, target, preferIp, preferDomain) {
 // HTML pages
 // ---------------------------------------------------------------------------
 
+/**
+ * Shared page stylesheet, following modern-web-guidance:
+ * - `color-scheme: light dark` on :root plus a <meta name="color-scheme">
+ *   so native UI (scrollbars, form controls) follows the system theme and
+ *   the first paint does not flash un-themed.
+ * - `light-dark()` tokens with a `prefers-color-scheme` fallback for
+ *   browsers without light-dark() support.
+ * - Form controls use `font: inherit` and stay at least 1rem / 48px so
+ *   they do not trigger iOS zoom and remain tappable.
+ * - `:user-invalid` (never bare `:invalid`) for validation styling, so
+ *   empty required fields are not flagged before interaction.
+ * - A visible `:focus-visible` outline on every control.
+ * - Tables live in a scrollable region (tabindex="0", role="region")
+ *   with a sticky header, and collapse to labelled cards under a
+ *   @container query on narrow widths.
+ */
+const PAGE_CSS = `
+:root{
+  color-scheme:light dark;
+  --bg:#ffffff;--fg:#1a1a1a;--muted:#5f6368;--line:#dfe1e5;
+  --surface:#f8f9fa;--code-bg:#f2f2f2;--accent:#0b57d0;--accent-fg:#ffffff;
+  --ok-bg:#e6f4ea;--ok-fg:#137333;--err-bg:#fce8e6;--err-fg:#a50e0e;
+  --focus:#0b57d0;
+  accent-color:var(--accent);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#121212;--fg:#e8eaed;--muted:#9aa0a6;--line:#3c4043;
+    --surface:#1f1f1f;--code-bg:#2b2b2b;--accent:#8ab4f8;--accent-fg:#0b1220;
+    --ok-bg:#1e3a2a;--ok-fg:#81c995;--err-bg:#3d1a1a;--err-fg:#f28b82;
+    --focus:#8ab4f8;
+  }
+}
+@supports (color: light-dark(#fff, #000)){
+  :root{
+    --bg:light-dark(#ffffff,#121212);--fg:light-dark(#1a1a1a,#e8eaed);
+    --muted:light-dark(#5f6368,#9aa0a6);--line:light-dark(#dfe1e5,#3c4043);
+    --surface:light-dark(#f8f9fa,#1f1f1f);--code-bg:light-dark(#f2f2f2,#2b2b2b);
+    --accent:light-dark(#0b57d0,#8ab4f8);--accent-fg:light-dark(#ffffff,#0b1220);
+    --ok-bg:light-dark(#e6f4ea,#1e3a2a);--ok-fg:light-dark(#137333,#81c995);
+    --err-bg:light-dark(#fce8e6,#3d1a1a);--err-fg:light-dark(#a50e0e,#f28b82);
+    --focus:light-dark(#0b57d0,#8ab4f8);
+  }
+}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:860px;margin:32px auto;padding:0 20px;line-height:1.6;color:var(--fg);background:var(--bg)}
+h1{font-size:24px}h2{font-size:18px;margin-top:32px;border-bottom:1px solid var(--line);padding-bottom:4px}h3{font-size:16px}
+a{color:var(--accent)}
+code{background:var(--code-bg);padding:2px 6px;border-radius:4px;word-break:break-all}
+label{display:block;margin:8px 0;font-size:14px}
+input[type=text],input[type=password],input[type=number],textarea{width:100%;padding:10px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--fg);font:inherit;font-size:max(1rem,1em);min-height:48px}
+textarea{font-family:ui-monospace,Menlo,monospace}
+input:user-invalid,textarea:user-invalid{border-color:var(--err-fg)}
+button{padding:10px 16px;margin:6px 6px 6px 0;cursor:pointer;border:1px solid var(--line);background:var(--surface);color:var(--fg);border-radius:4px;font:inherit;font-size:max(1rem,1em);min-height:48px}
+button.primary{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+.hint{color:var(--muted);font-size:13px}
+.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:180px}
+.table-wrapper{overflow:auto;max-inline-size:100%;max-block-size:min(500px,80vh);container-type:inline-size}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:14px;margin-top:8px}
+caption{text-align:left;font-weight:600;padding:4px 0}
+thead{position:sticky;inset-block-start:0;z-index:1}
+th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;background:var(--bg)}
+th{background:var(--surface)}
+tbody th{position:sticky;inset-inline-start:0}
+td input{width:100%;padding:4px}
+#msg{padding:10px;border-radius:4px;margin:12px 0;display:none}
+#msg.ok{display:block;background:var(--ok-bg);color:var(--ok-fg)}
+#msg.err{display:block;background:var(--err-bg);color:var(--err-fg)}
+@container (width < 600px){
+  table,thead,tbody,tr,th,td{display:block}
+  thead{display:none}
+  tr{margin-block-end:1.5rem;border:1px solid var(--line)}
+  tbody th{position:sticky;inset-block-start:0;z-index:2;background:var(--surface)}
+  td::before{content:attr(data-label) ": ";font-weight:600}
+}
+`;
+
 function landingPageHtml(env) {
   const name = escapeHtml(env.SUBNAME || DEFAULT_SUBNAME);
   return `<!DOCTYPE html>
@@ -2867,21 +3396,22 @@ function landingPageHtml(env) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>${name}</title>
-<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:720px;margin:48px auto;padding:0 20px;line-height:1.6;color:#222}code{background:#f2f2f2;padding:2px 6px;border-radius:4px}h1{font-size:24px}</style>
+<style>${PAGE_CSS}</style>
 </head>
 <body>
 <h1>${name}</h1>
 <p>订阅聚合服务：将多个节点链接与订阅链接整合成一个统一订阅，并按客户端自动转换格式。</p>
 <h2>使用方法</h2>
-<p>在订阅地址后加上访问口令：</p>
-<p><code>/?token=YOUR_TOKEN</code> 或 <code>/sub?token=YOUR_TOKEN</code></p>
+<p>在订阅地址后加上访问口令，两种写法都可以：</p>
+<p><code>/sub/YOUR_TOKEN</code> 或 <code>/sub?token=YOUR_TOKEN</code></p>
 <p>输出格式：<code>?target=base64</code>（默认）、<code>raw</code>、<code>clash</code>、<code>singbox</code>，其它格式（surge / quanx / loon / shadowrocket）需要配置 <code>SUBAPI</code> 转换后端。</p>
 <h2>edgeTunnel 优选</h2>
 <p>对部署在 Cloudflare 上的 edgeTunnel 节点，可用优选 IP / 域名替换连接地址：</p>
-<p><code>?ip=1.2.3.4</code> 或 <code>?domain=example.com</code>（两者都给时 IP 优先）。原始域名的 TLS SNI 与 Host 头会被保留。未带 <code>ip</code> 时自动从 KV 的 IP 库中挑选（见管理页）。</p>
+<p><code>?ip=1.2.3.4</code> 或 <code>?domain=example.com</code>（两者都给时 IP 优先）。原始域名的 TLS SNI 与 Host 头会被保留。未带 <code>ip</code> 时自动从 IP 库（KV + 在线列表）中挑选（见管理页）。</p>
 <h2>管理</h2>
-<p>主口令持有者可打开 <code>/admin?token=YOUR_TOKEN</code> 管理配置与 IP 库（需要绑定 KV 命名空间 <code>OMNI_KV</code>）。</p>
+<p>主口令持有者可打开 <code>/admin/YOUR_TOKEN</code> 管理配置与 IP 库（需要绑定 KV 命名空间 <code>OMNI_KV</code>）。</p>
 <p>未配置访问口令时本服务公开访问；配置 <code>TOKEN</code> 后需要鉴权。</p>
 </body>
 </html>`;
@@ -2892,20 +3422,21 @@ function dashboardHtml(env, nodes, stats, url, tokens) {
   const origin = url.origin;
   const guest = tokens ? tokens.daily : '';
   const mk = (target) =>
-    `${origin}/sub?token=${encodeURIComponent(guest)}&target=${target}`;
+    `${origin}/sub/${encodeURIComponent(guest)}?target=${target}`;
   const targets = ['base64', 'raw', 'clash', 'singbox', 'surge', 'quanx', 'loon', 'shadowrocket'];
   const rows = targets
     .map((t) => `<li><a href="${escapeHtml(mk(t))}">${t}</a></li>`)
     .join('\n');
   const preferExample =
-    `${origin}/sub?token=${encodeURIComponent(guest)}&target=clash&ip=104.21.0.1&domain=example.com`;
+    `${origin}/sub/${encodeURIComponent(guest)}?target=clash&ip=104.21.0.1&domain=example.com`;
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>${name} — 订阅管理</title>
-<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:720px;margin:48px auto;padding:0 20px;line-height:1.6;color:#222}code{background:#f2f2f2;padding:2px 6px;border-radius:4px;word-break:break-all}h1{font-size:24px}li{margin:4px 0}</style>
+<style>${PAGE_CSS}</style>
 </head>
 <body>
 <h1>${name}</h1>
@@ -2916,7 +3447,7 @@ ${rows}
 </ul>
 <h2>edgeTunnel 优选示例</h2>
 <p><code>${escapeHtml(preferExample)}</code></p>
-<p>说明：<code>ip</code> 替换连接地址，<code>domain</code> 替换为优选域名；两者都给时 IP 优先。原始域名的 TLS SNI 与 Host 头会被保留，替换过的节点名后会追加“(优选)”。也可用 <code>preferIp</code> / <code>preferDomain</code> 作为同义参数，或直接配置环境变量 <code>PREFER_IP</code> / <code>PREFER_DOMAIN</code>。</p>
+<p>说明：<code>ip</code> 替换连接地址，<code>domain</code> 替换为优选域名；两者都给时 IP 优先。原始域名的 TLS SNI 与 Host 头会被保留，带标签的优选 IP 会把节点名换成标签（如 🇺🇸-US-LAX-01），没有标签时节点名后追加“(优选)”。也可用 <code>preferIp</code> / <code>preferDomain</code> 作为同义参数，或直接配置环境变量 <code>PREFER_IP</code> / <code>PREFER_DOMAIN</code>。</p>
 <h2>固定访客 token</h2>
 <p><code>${escapeHtml(tokens ? tokens.fixed : '')}</code></p>
 <p>缓存：${escapeHtml(String(parseInt(env.SUBUPTIME, 10) || DEFAULT_UPTIME_HOURS))} 小时；加 <code>?nocache=1</code> 可绕过缓存。</p>
@@ -2945,12 +3476,16 @@ async function handleFetch(request, env, ctx) {
   const cfg = await resolveEffectiveConfig(env);
 
   // Admin UI + management APIs (master token only, see handleAdmin).
-  if (url.pathname === '/admin' || url.pathname.startsWith('/api/')) {
+  // /admin/<token> carries the token in the path; /api/* takes it from
+  // ?token= or a Bearer header (see adminTokenFromRequest).
+  if (url.pathname === '/admin' || url.pathname.startsWith('/admin/') || url.pathname.startsWith('/api/')) {
     return await handleAdmin(request, env, cfg);
   }
 
   // Auth: TOKEN empty => public; otherwise master / fixed guest / daily guest.
   // The master token is the effective TOKEN (KV config token wins over env).
+  // Tokens may be passed as ?token=<redacted> as the first path segment (/<token>),
+  // or in the path after /sub/ or /admin/ (see isAuthorized).
   const master = (cfg.TOKEN || '').trim();
   let tokens = null;
   if (master) tokens = await buildTokens(master);
@@ -2974,12 +3509,23 @@ async function handleFetch(request, env, ctx) {
   // --- Subscription flow ---
   const { ip: preferIp0, domain: preferDomain, autoPick } = resolvePrefer(url, cfg);
   let preferIp = preferIp0;
+  let preferLabel = '';
   if (autoPick) {
-    // No explicit IP anywhere: pick one from the KV IP pool (region-aware).
-    // Empty pool => no replacement, same behaviour as before KV existed.
-    const pool = await loadKvIps(env);
-    const picked = pickPreferredIp(pool, url.searchParams.get('region') || '');
-    if (picked) preferIp = picked;
+    // No explicit IP anywhere: pick one from the preferred-IP pool
+    // (KV library + online IPLIST lists), region-aware. Empty pool =>
+    // no replacement, same behaviour as before KV existed.
+    const pool = await loadPreferredIpPool(env, cfg);
+    const pickedEntry = pickPreferredIpEntry(pool, url.searchParams.get('region') || '');
+    if (pickedEntry) {
+      preferIp = pickedEntry.ip;
+      preferLabel = pickedEntry.label || '';
+    }
+  } else if (preferIp) {
+    // Explicit ?ip= (or PREFER_IP): reuse the pool label when this IP is
+    // known, so the node name still reflects the detected location.
+    const pool = await loadPreferredIpPool(env, cfg);
+    const known = pool.find((e) => String(e.ip || '').toLowerCase() === preferIp.toLowerCase());
+    if (known && known.label) preferLabel = known.label;
   }
   const noCache = url.searchParams.get('nocache') === '1';
   const edgeHosts = splitCsv(cfg.EDGETUNNEL_HOSTS || '');
@@ -2993,7 +3539,7 @@ async function handleFetch(request, env, ctx) {
   }
 
   const { nodes, stats } = await getNodes(cfg, request);
-  applyPrefer(nodes, preferIp, preferDomain, edgeHosts);
+  applyPrefer(nodes, preferIp, preferDomain, edgeHosts, preferLabel);
 
   let body = '';
   let contentType = 'text/plain; charset=utf-8';
