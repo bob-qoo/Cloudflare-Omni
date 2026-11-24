@@ -1,0 +1,7 @@
+# Cloudflare-Omni 示例优选 IP 列表
+# 每行一个 IP，格式：ip 或 ip#region 或 ip#region#label
+# 仅作 IPLIST 在线列表功能的示例，可替换为自己的列表地址。
+104.21.0.1#US
+104.21.0.2#US
+104.16.0.1#US#us-1
+172.67.0.1#US
