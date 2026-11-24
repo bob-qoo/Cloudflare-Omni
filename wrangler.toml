@@ -1,0 +1,35 @@
+name = "cloudflare-omni"
+main = "src/index.js"
+compatibility_date = "2026-11-24"
+
+# No KV / R2 / Durable Objects are required.
+# Caching uses the built-in Cache API; secrets live in Dashboard vars.
+
+# ---------------------------------------------------------------------------
+# Available environment variables (set them in the Cloudflare Dashboard
+# under Workers & Pages > Settings > Variables, or in a local `.dev.vars`
+# file for `wrangler dev`). All of them are optional except TOKEN when you
+# want the subscription to be private.
+# ---------------------------------------------------------------------------
+# [vars]
+# TOKEN = ""              # Access password. Empty = public, no auth required.
+#                         # Accepts: master token, MD5(TOKEN) fixed guest
+#                         # token, and MD5(TOKEN + UTC date "YYYY-MM-DD")
+#                         # daily guest token.
+# LINK = ""               # Node links and subscription URLs, one per line.
+#                         # Node links: vless://, vmess://, trojan://, ss://,
+#                         # hysteria2://, tuic://, snell://, anytls://,
+#                         # wireguard://, socks://, http:// ...
+#                         # Subscription URLs: plain http(s):// links.
+# LINKSUB = ""            # Extra subscription URLs, one per line.
+# SUBAPI = ""             # External subscription-converter backend
+#                         # (e.g. self-hosted psub). Empty = built-in
+#                         # conversion only (base64/raw/clash/singbox).
+# SUBNAME = "Cloudflare-Omni"  # Subscription file name.
+# SUBUPTIME = "6"         # Cache TTL, in hours.
+# PREFER_IP = ""          # Preferred IP for edgeTunnel nodes
+#                         # (comma-separated, the first one wins).
+# PREFER_DOMAIN = ""      # Preferred domain for edgeTunnel nodes.
+# EDGETUNNEL_HOSTS = ""   # Extra domains treated as edgeTunnel,
+#                         # comma-separated. Built-in: *.trycloudflare.com
+#                         # and *.workers.dev are always treated as edgeTunnel.

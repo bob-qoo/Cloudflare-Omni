@@ -1,0 +1,2267 @@
+/**
+ * Cloudflare-Omni — subscription aggregator & converter on Cloudflare Workers.
+ *
+ * Aggregates node links and subscription URLs from env vars into one unified
+ * subscription, with native output for base64 / raw / Clash / sing-box and
+ * forwarding to an external converter backend (e.g. psub) for other targets.
+ * For edgeTunnel nodes (Cloudflare-hosted), it can rewrite the connect
+ * address to a preferred IP / domain while keeping the original TLS SNI
+ * and Host header intact.
+ *
+ * No npm dependencies. Pure Worker runtime APIs only
+ * (fetch, Cache, crypto.subtle, TextEncoder/TextDecoder, atob/btoa).
+ */
+
+export default { fetch: handleFetch };
+
+// ---------------------------------------------------------------------------
+// Config & constants
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SUBNAME = 'Cloudflare-Omni';
+const DEFAULT_UPTIME_HOURS = 6;
+const FETCH_TIMEOUT_MS = 8000; // per subscription fetch
+const SUB_TOTAL_BYTES = 107374182400; // 100 GiB, shown in subscription-userinfo
+const SUB_EXPIRE_TS = 4102444800; // 2100-01-01 00:00:00 UTC
+const URLTEST_URL = 'http://www.gstatic.com/generate_204';
+const SELECT_GROUP = '🚀 节点选择';
+const URLTEST_GROUP = '⚡ 自动选择';
+
+// Protocols we recognise as node links (anything else starting with
+// http(s):// is treated as a subscription URL, see classifyLine).
+const NODE_SCHEMES = new Set([
+  'vless', 'vmess', 'trojan', 'ss', 'shadowsocks',
+  'hysteria', 'hysteria2', 'hy2', 'tuic', 'snell',
+  'anytls', 'wireguard', 'wg', 'socks', 'socks5', 'http', 'https',
+]);
+
+// Built-in edgeTunnel host suffixes (in addition to EDGETUNNEL_HOSTS).
+const BUILTIN_EDGE_SUFFIXES = ['.trycloudflare.com', '.workers.dev'];
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+/** Split a multi-line env value into trimmed, non-empty lines. */
+function splitLines(text) {
+  if (!text) return [];
+  return String(text)
+    .split(/[\r\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Split a comma-separated env value into trimmed, non-empty items. */
+function splitCsv(text) {
+  if (!text) return [];
+  return String(text)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * MD5 hex digest (lowercase).
+ * Prefers WebCrypto (Cloudflare Workers supports MD5 in subtle.digest);
+ * falls back to a pure-JS implementation when the runtime does not
+ * (e.g. Node's WebCrypto rejects the MD5 algorithm name).
+ */
+async function md5Hex(text) {
+  try {
+    const data = new TextEncoder().encode(text);
+    const buf = await crypto.subtle.digest('MD5', data);
+    return [...new Uint8Array(buf)]
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  } catch {
+    return md5PureJS(text);
+  }
+}
+
+/** Pure-JS MD5 (RFC 1321), UTF-8 input, lowercase hex output. */
+function md5PureJS(str) {
+  const safeAdd = (x, y) => {
+    const lsw = (x & 0xffff) + (y & 0xffff);
+    const msw = (x >> 16) + (y >> 16) + (lsw >> 16);
+    return (msw << 16) | (lsw & 0xffff);
+  };
+  const rotl = (n, c) => (n << c) | (n >>> (32 - c));
+  const cmn = (q, a, b, x, s, t) => safeAdd(rotl(safeAdd(safeAdd(a, q), safeAdd(x, t)), s), b);
+  const ff = (a, b, c, d, x, s, t) => cmn((b & c) | (~b & d), a, b, x, s, t);
+  const gg = (a, b, c, d, x, s, t) => cmn((b & d) | (c & ~d), a, b, x, s, t);
+  const hh = (a, b, c, d, x, s, t) => cmn(b ^ c ^ d, a, b, x, s, t);
+  const ii = (a, b, c, d, x, s, t) => cmn(c ^ (b | ~d), a, b, x, s, t);
+
+  const bytes = new TextEncoder().encode(str);
+  const bitLen = bytes.length * 8;
+  const totalWords = (((bitLen + 64) >>> 9) << 4) + 16;
+  const x = new Array(totalWords).fill(0);
+  for (let i = 0; i < bytes.length; i++) x[i >> 2] |= bytes[i] << ((i % 4) * 8);
+  x[bitLen >> 5] |= 0x80 << (bitLen % 32);
+  x[(((bitLen + 64) >>> 9) << 4) + 14] = bitLen;
+
+  let a = 1732584193, b = -271733879, c = -1732584194, d = 271733878;
+  for (let i = 0; i < x.length; i += 16) {
+    const oa = a, ob = b, oc = c, od = d;
+    a = ff(a, b, c, d, x[i], 7, -680876936); d = ff(d, a, b, c, x[i + 1], 12, -389564586);
+    c = ff(c, d, a, b, x[i + 2], 17, 606105819); b = ff(b, c, d, a, x[i + 3], 22, -1044525330);
+    a = ff(a, b, c, d, x[i + 4], 7, -176418897); d = ff(d, a, b, c, x[i + 5], 12, 1200080426);
+    c = ff(c, d, a, b, x[i + 6], 17, -1473231341); b = ff(b, c, d, a, x[i + 7], 22, -45705983);
+    a = ff(a, b, c, d, x[i + 8], 7, 1770035416); d = ff(d, a, b, c, x[i + 9], 12, -1958414417);
+    c = ff(c, d, a, b, x[i + 10], 17, -42063); b = ff(b, c, d, a, x[i + 11], 22, -1990404162);
+    a = ff(a, b, c, d, x[i + 12], 7, 1804603682); d = ff(d, a, b, c, x[i + 13], 12, -40341101);
+    c = ff(c, d, a, b, x[i + 14], 17, -1502002290); b = ff(b, c, d, a, x[i + 15], 22, 1236535329);
+    a = gg(a, b, c, d, x[i + 1], 5, -165796510); d = gg(d, a, b, c, x[i + 6], 9, -1069501632);
+    c = gg(c, d, a, b, x[i + 11], 14, 643717713); b = gg(b, c, d, a, x[i], 20, -373897302);
+    a = gg(a, b, c, d, x[i + 5], 5, -701558691); d = gg(d, a, b, c, x[i + 10], 9, 38016083);
+    c = gg(c, d, a, b, x[i + 15], 14, -660478335); b = gg(b, c, d, a, x[i + 4], 20, -405537848);
+    a = gg(a, b, c, d, x[i + 9], 5, 568446438); d = gg(d, a, b, c, x[i + 14], 9, -1019803690);
+    c = gg(c, d, a, b, x[i + 3], 14, -187363961); b = gg(b, c, d, a, x[i + 8], 20, 1163531501);
+    a = gg(a, b, c, d, x[i + 13], 5, -1444681467); d = gg(d, a, b, c, x[i + 2], 9, -51403784);
+    c = gg(c, d, a, b, x[i + 7], 14, 1735328473); b = gg(b, c, d, a, x[i + 12], 20, -1926607734);
+    a = hh(a, b, c, d, x[i + 5], 4, -378558); d = hh(d, a, b, c, x[i + 8], 11, -2022574463);
+    c = hh(c, d, a, b, x[i + 11], 16, 1839030562); b = hh(b, c, d, a, x[i + 14], 23, -35309556);
+    a = hh(a, b, c, d, x[i + 1], 4, -1530992060); d = hh(d, a, b, c, x[i + 4], 11, 1272893353);
+    c = hh(c, d, a, b, x[i + 7], 16, -155497632); b = hh(b, c, d, a, x[i + 10], 23, -1094730640);
+    a = hh(a, b, c, d, x[i + 13], 4, 681279174); d = hh(d, a, b, c, x[i], 11, -358537222);
+    c = hh(c, d, a, b, x[i + 3], 16, -722521979); b = hh(b, c, d, a, x[i + 6], 23, 76029189);
+    a = hh(a, b, c, d, x[i + 9], 4, -640364487); d = hh(d, a, b, c, x[i + 12], 11, -421815835);
+    c = hh(c, d, a, b, x[i + 15], 16, 530742520); b = hh(b, c, d, a, x[i + 2], 23, -995338651);
+    a = ii(a, b, c, d, x[i], 6, -198630844); d = ii(d, a, b, c, x[i + 7], 10, 1126891415);
+    c = ii(c, d, a, b, x[i + 14], 15, -1416354905); b = ii(b, c, d, a, x[i + 5], 21, -57434055);
+    a = ii(a, b, c, d, x[i + 12], 6, 1700485571); d = ii(d, a, b, c, x[i + 3], 10, -1894986606);
+    c = ii(c, d, a, b, x[i + 10], 15, -1051523); b = ii(b, c, d, a, x[i + 1], 21, -2054922799);
+    a = ii(a, b, c, d, x[i + 8], 6, 1873313359); d = ii(d, a, b, c, x[i + 15], 10, -30611744);
+    c = ii(c, d, a, b, x[i + 6], 15, -1560198380); b = ii(b, c, d, a, x[i + 13], 21, 1309151649);
+    a = ii(a, b, c, d, x[i + 4], 6, -145523070); d = ii(d, a, b, c, x[i + 11], 10, -1120210379);
+    c = ii(c, d, a, b, x[i + 2], 15, 718787259); b = ii(b, c, d, a, x[i + 9], 21, -343485551);
+    a = safeAdd(a, oa); b = safeAdd(b, ob); c = safeAdd(c, oc); d = safeAdd(d, od);
+  }
+  let hex = '';
+  for (const w of [a, b, c, d]) {
+    for (let i = 0; i < 4; i++) {
+      hex += ((w >>> (i * 8)) & 0xff).toString(16).padStart(2, '0');
+    }
+  }
+  return hex;
+}
+
+/** UTF-8 safe base64 encode (btoa only handles Latin-1). */
+function b64encode(str) {
+  const bytes = new TextEncoder().encode(str);
+  let bin = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+/** UTF-8 safe base64 decode. Returns null on invalid input. */
+function b64decode(str) {
+  if (!str) return null;
+  try {
+    const clean = String(str).replace(/\s/g, '');
+    if (!/^[A-Za-z0-9+/=_-]+$/.test(clean)) return null;
+    // Tolerate URL-safe alphabet and missing padding.
+    const norm = clean.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = norm + '='.repeat((4 - (norm.length % 4)) % 4);
+    const bin = atob(padded);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** Heuristic: does this text look like base64 that decodes to node links? */
+function looksLikeBase64Sub(text) {
+  const clean = String(text).trim().replace(/\s/g, '');
+  if (clean.length < 8 || !/^[A-Za-z0-9+/=]+$/.test(clean)) return false;
+  const decoded = b64decode(clean);
+  return !!decoded && decoded.includes('://');
+}
+
+/** HTML-escape a string for the landing/dashboard pages. */
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * Parse a URL query string into a plain object without turning '+' into
+ * a space (proxy links percent-encode their values, so a raw '+' is a
+ * literal plus). Duplicate keys: last one wins.
+ */
+function parseQuery(qs) {
+  const out = {};
+  if (!qs) return out;
+  for (const pair of qs.split('&')) {
+    if (!pair) continue;
+    const eq = pair.indexOf('=');
+    const k = eq >= 0 ? pair.slice(0, eq) : pair;
+    const v = eq >= 0 ? pair.slice(eq + 1) : '';
+    try {
+      out[decodeURIComponent(k)] = decodeURIComponent(v);
+    } catch {
+      out[k] = v; // keep raw on malformed percent-encoding
+    }
+  }
+  return out;
+}
+
+/** Serialize a plain object back to a query string (skips empty values). */
+function stringifyQuery(params) {
+  const parts = [];
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === '') continue;
+    parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`);
+  }
+  return parts.join('&');
+}
+
+/**
+ * Split a proxy link into its structural parts without relying on the
+ * URL parser (non-standard schemes and base64 userinfo can confuse it).
+ * Returns { scheme, userinfo, host, port, path, query, fragment }.
+ */
+function splitLink(link) {
+  let rest = String(link).trim();
+  let fragment = '';
+  const hashIdx = rest.indexOf('#');
+  if (hashIdx >= 0) {
+    fragment = rest.slice(hashIdx + 1);
+    rest = rest.slice(0, hashIdx);
+  }
+  let scheme = '';
+  const schemeIdx = rest.indexOf('://');
+  if (schemeIdx >= 0) {
+    scheme = rest.slice(0, schemeIdx).toLowerCase();
+    rest = rest.slice(schemeIdx + 3);
+  }
+  let query = '';
+  const qIdx = rest.indexOf('?');
+  if (qIdx >= 0) {
+    query = rest.slice(qIdx + 1);
+    rest = rest.slice(0, qIdx);
+  }
+  // rest is now [userinfo@]host[:port][/path...]
+  let path = '';
+  const slashIdx = rest.indexOf('/');
+  if (slashIdx >= 0) {
+    path = rest.slice(slashIdx);
+    rest = rest.slice(0, slashIdx);
+  }
+  let userinfo = '';
+  const atIdx = rest.lastIndexOf('@');
+  let hostport = rest;
+  if (atIdx >= 0) {
+    userinfo = rest.slice(0, atIdx);
+    hostport = rest.slice(atIdx + 1);
+  }
+  let host = hostport;
+  let port = '';
+  // IPv6 literal: [::1]:port
+  const v6 = hostport.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (v6) {
+    host = v6[1];
+    port = v6[2] || '';
+  } else {
+    const colonIdx = hostport.lastIndexOf(':');
+    if (colonIdx >= 0 && /^\d+$/.test(hostport.slice(colonIdx + 1))) {
+      host = hostport.slice(0, colonIdx);
+      port = hostport.slice(colonIdx + 1);
+    }
+  }
+  return { scheme, userinfo, host, port, path, query, fragment };
+}
+
+/** Decode a link fragment into a human readable node name. */
+function decodeName(fragment) {
+  if (!fragment) return '';
+  try {
+    return decodeURIComponent(fragment);
+  } catch {
+    return fragment;
+  }
+}
+
+/** Render a YAML scalar: bare when safe, double-quoted (JSON style) otherwise. */
+function yamlScalar(v) {
+  if (v === null || v === undefined) return '""';
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (typeof v === 'number') return String(v);
+  const s = String(v);
+  if (s === '') return '""';
+  // Bare scalars: plain ASCII without YAML-special characters.
+  if (/^[A-Za-z0-9][A-Za-z0-9._\-/:]*$/.test(s) && !/[:#]/.test(s.slice(1))) {
+    return s;
+  }
+  return JSON.stringify(s); // valid double-quoted YAML scalar
+}
+
+/** Indent every line of a block by `n` spaces (for nested YAML). */
+function indentBlock(text, n) {
+  const pad = ' '.repeat(n);
+  return text
+    .split('\n')
+    .map((line) => (line ? pad + line : line))
+    .join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Node model & parsing
+// ---------------------------------------------------------------------------
+// A normalized node keeps the original query params (URL-based protocols)
+// or the decoded JSON object (vmess) as the source of truth for rebuilding
+// the link, plus a parsed "view" of the fields every renderer needs.
+// Nodes that are never modified are emitted via their original `raw` link,
+// so parsing/rebuilding is lossless for the common case.
+
+function newNode(protocol) {
+  return {
+    protocol,          // normalized protocol id
+    name: '',
+    server: '',
+    port: 0,
+    uuid: '',          // vless / vmess / trojan id
+    password: '',      // trojan / ss / hy2 / tuic / anytls password, snell psk
+    cipher: '',        // ss method, snell cipher
+    tls: false,
+    sni: '',
+    host: '',          // ws / xhttp Host header
+    path: '',
+    type: 'tcp',       // network: tcp | ws | grpc | xhttp | h2 | httpupgrade
+    alpn: '',
+    fingerprint: '',
+    flow: '',
+    security: '',      // vless encryption / trojan security marker
+    params: {},        // extra query params, preserved for link rebuild
+    userinfo: '',      // raw userinfo part (reused when rebuilding)
+    urlPath: '',       // path segment after host:port (usually empty)
+    vmess: null,       // decoded vmess JSON object (vmess only)
+    raw: '',
+    modified: false,
+    preferApplied: false,
+  };
+}
+
+/** Fill the view fields (tls/sni/host/...) from node.params. */
+function viewFromParams(node) {
+  const p = node.params;
+  node.tls = p.security === 'tls' || p.tls === 'tls' || node.protocol === 'trojan';
+  node.sni = p.sni || p.peer || '';
+  node.host = p.host || '';
+  node.path = p.path || '';
+  node.type = p.type || 'tcp';
+  node.alpn = p.alpn || '';
+  node.fingerprint = p.fp || p.fingerprint || '';
+  node.flow = p.flow || '';
+  node.security = p.security || p.encryption || '';
+}
+
+/** Write one view field back into params (and keep the view in sync). */
+function setNodeField(node, field, value) {
+  node[field] = value;
+  if (node.vmess) {
+    // vmess JSON keys differ from the view names.
+    const map = {
+      server: 'add', uuid: 'id', cipher: 'scy', type: 'net',
+      fingerprint: 'fp',
+    };
+    if (field === 'tls') {
+      node.vmess.tls = value ? 'tls' : '';
+    } else if (map[field]) {
+      node.vmess[map[field]] = value;
+    } else if (['port', 'host', 'path', 'sni', 'alpn'].includes(field)) {
+      node.vmess[field] = value;
+    }
+    return;
+  }
+  // 'tls' has no entry in keyMap below: handle it before the lookup,
+  // otherwise this branch would be unreachable.
+  if (field === 'tls') {
+    if (value) node.params.security = 'tls';
+    else if (node.params.security === 'tls') delete node.params.security;
+    return;
+  }
+  const keyMap = {
+    sni: 'sni', host: 'host', path: 'path', type: 'type',
+    alpn: 'alpn', fingerprint: 'fp', flow: 'flow', security: 'security',
+  };
+  const key = keyMap[field];
+  if (!key) return;
+  if (value === '' || value === undefined || value === null) delete node.params[key];
+  else node.params[key] = String(value);
+}
+
+/** URL-decode a userinfo credential, tolerating malformed input. */
+function decCred(s) {
+  if (!s) return '';
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/**
+ * Parse one proxy link into a normalized node.
+ * Returns the node, or null when the link cannot be parsed.
+ */
+function parseNode(link) {
+  if (!link || typeof link !== 'string') return null;
+  const text = link.trim();
+  if (!text.includes('://')) return null;
+  const parts = splitLink(text);
+  const scheme = parts.scheme;
+  if (!NODE_SCHEMES.has(scheme)) return null;
+
+  const params = parseQuery(parts.query);
+  const name = decodeName(parts.fragment);
+  const port = parts.port ? parseInt(parts.port, 10) : 0;
+
+  // --- vmess: base64 JSON in the userinfo/host part ----------------------
+  if (scheme === 'vmess') {
+    // vmess://<base64-json>  (the whole authority is the payload)
+    const payload = parts.userinfo ? `${parts.userinfo}@${parts.host}` : parts.host;
+    const jsonText = b64decode(payload.replace(/\s/g, ''));
+    if (!jsonText) return null;
+    let obj;
+    try {
+      obj = JSON.parse(jsonText);
+    } catch {
+      return null;
+    }
+    if (!obj || typeof obj !== 'object' || !obj.add) return null;
+    const node = newNode('vmess');
+    node.raw = text;
+    node.vmess = obj;
+    node.name = obj.ps || name || '';
+    node.server = String(obj.add || '');
+    node.port = parseInt(obj.port, 10) || 0;
+    node.uuid = String(obj.id || '');
+    node.cipher = String(obj.scy || 'auto');
+    node.type = String(obj.net || 'tcp');
+    node.host = String(obj.host || '');
+    node.path = String(obj.path || '');
+    node.tls = obj.tls === 'tls';
+    node.sni = String(obj.sni || '');
+    node.alpn = String(obj.alpn || '');
+    node.fingerprint = String(obj.fp || '');
+    node.params = { aid: obj.aid, type: obj.type };
+    return node;
+  }
+
+  // --- shadowsocks: two common encodings ----------------------------------
+  if (scheme === 'ss' || scheme === 'shadowsocks') {
+    const node = newNode('ss');
+    node.raw = text;
+    node.params = params;
+    node.urlPath = parts.path;
+    let method = '';
+    let password = '';
+    let server = '';
+    let portNum = 0;
+    // Form B: ss://<b64(method:password)>@server:port
+    // Form A: ss://<b64(method:password@server:port)> (host holds the payload)
+    const tryInner = (decoded) => {
+      if (!decoded || !decoded.includes('@')) return false;
+      const at = decoded.lastIndexOf('@');
+      const creds = decoded.slice(0, at);
+      const hp = decoded.slice(at + 1);
+      const colon = creds.indexOf(':');
+      if (colon < 0) return false;
+      const hpParts = splitLink(`x://${hp}`);
+      method = creds.slice(0, colon);
+      password = creds.slice(colon + 1);
+      server = hpParts.host;
+      portNum = hpParts.port ? parseInt(hpParts.port, 10) : 0;
+      return true;
+    };
+    if (parts.userinfo) {
+      // Form B (or plaintext method:password@server:port)
+      const decoded = b64decode(parts.userinfo);
+      if (decoded && decoded.includes(':') && !decoded.includes('@')) {
+        const colon = decoded.indexOf(':');
+        method = decoded.slice(0, colon);
+        password = decoded.slice(colon + 1);
+      } else if (parts.userinfo.includes(':')) {
+        const colon = parts.userinfo.indexOf(':');
+        method = decCred(parts.userinfo.slice(0, colon));
+        password = decCred(parts.userinfo.slice(colon + 1));
+      } else {
+        return null;
+      }
+      server = parts.host;
+      portNum = port;
+    } else {
+      // Form A: the whole authority is the base64 payload.
+      const decoded = b64decode(parts.host + parts.path.replace(/^\//, ''));
+      if (!tryInner(decoded)) return null;
+    }
+    if (!method || !server || !portNum) return null;
+    node.name = name;
+    node.server = server;
+    node.port = portNum;
+    node.cipher = method;
+    node.password = password;
+    node.userinfo = b64encode(`${method}:${password}`).replace(/=+$/, '');
+    viewFromParams(node);
+    return node;
+  }
+
+  // --- snell: base64(method:psk@server:port) or plaintext psk@server:port --
+  if (scheme === 'snell') {
+    const node = newNode('snell');
+    node.raw = text;
+    node.params = params;
+    let method = '';
+    let psk = '';
+    let server = '';
+    let portNum = 0;
+    if (parts.userinfo) {
+      psk = decCred(parts.userinfo);
+      server = parts.host;
+      portNum = port;
+      method = params.method || '';
+    } else {
+      const decoded = b64decode(parts.host);
+      if (!decoded || !decoded.includes('@')) return null;
+      const at = decoded.lastIndexOf('@');
+      const creds = decoded.slice(0, at);
+      const hp = decoded.slice(at + 1);
+      const colon = creds.indexOf(':');
+      if (colon < 0) return null;
+      method = creds.slice(0, colon);
+      psk = creds.slice(colon + 1);
+      const hpParts = splitLink(`x://${hp}`);
+      server = hpParts.host;
+      portNum = hpParts.port ? parseInt(hpParts.port, 10) : 0;
+    }
+    if (!server || !portNum) return null;
+    node.name = name;
+    node.server = server;
+    node.port = portNum;
+    node.cipher = method;
+    node.password = psk;
+    viewFromParams(node);
+    return node;
+  }
+
+  // --- generic URL-based protocols ----------------------------------------
+  const node = newNode(
+    scheme === 'hy2' ? 'hysteria2'
+      : scheme === 'wg' ? 'wireguard'
+      : scheme === 'socks' ? 'socks5'
+      : scheme,
+  );
+  node.raw = text;
+  node.params = params;
+  node.userinfo = parts.userinfo;
+  node.urlPath = parts.path;
+  node.name = name;
+  node.server = parts.host;
+  node.port = port;
+  if (!node.server || !node.port) return null;
+
+  switch (node.protocol) {
+    case 'vless': {
+      node.uuid = decCred(parts.userinfo);
+      if (!node.uuid) return null;
+      break;
+    }
+    case 'trojan': {
+      node.password = decCred(parts.userinfo);
+      if (!node.password) return null;
+      node.tls = true;
+      break;
+    }
+    case 'hysteria2': {
+      node.password = decCred(parts.userinfo);
+      break;
+    }
+    case 'hysteria': {
+      // hysteria://[user:pass@]server:port?auth=...&protocol=...
+      if (parts.userinfo) {
+        node.password = decCred(parts.userinfo);
+      } else if (params.auth) {
+        node.password = params.auth;
+      } else if (params.authStr || params.auth_str) {
+        node.password = params.authStr || params.auth_str;
+      }
+      break;
+    }
+    case 'tuic': {
+      // tuic://uuid:password@server:port
+      const cred = decCred(parts.userinfo);
+      const colon = cred.indexOf(':');
+      if (colon >= 0) {
+        node.uuid = cred.slice(0, colon);
+        node.password = cred.slice(colon + 1);
+      } else {
+        node.uuid = cred;
+      }
+      if (!node.uuid) return null;
+      break;
+    }
+    case 'anytls': {
+      node.password = decCred(parts.userinfo);
+      break;
+    }
+    case 'wireguard': {
+      // wireguard://privateKey@server:port?publicKey=..&address=..&...
+      node.password = decCred(parts.userinfo); // private key
+      break;
+    }
+    case 'socks5': {
+      const cred = decCred(parts.userinfo);
+      const colon = cred.indexOf(':');
+      if (colon >= 0) {
+        node.uuid = cred.slice(0, colon);
+        node.password = cred.slice(colon + 1);
+      }
+      break;
+    }
+    case 'http': {
+      const cred = decCred(parts.userinfo);
+      const colon = cred.indexOf(':');
+      if (colon >= 0) {
+        node.uuid = cred.slice(0, colon);
+        node.password = cred.slice(colon + 1);
+      }
+      break;
+    }
+    default:
+      return null;
+  }
+  viewFromParams(node);
+  return node;
+}
+
+// ---------------------------------------------------------------------------
+// Link rebuild (only used when a node was modified, e.g. prefer replacement
+// or rename; unmodified nodes are emitted via their original `raw` link)
+// ---------------------------------------------------------------------------
+
+function buildLink(node) {
+  if (!node.modified && node.raw) return node.raw;
+  const server = node.server.includes(':') && !node.server.startsWith('[')
+    ? `[${node.server}]`
+    : node.server;
+  const nameFrag = node.name ? `#${encodeURIComponent(node.name)}` : '';
+  const portPart = node.port ? `:${node.port}` : '';
+
+  switch (node.protocol) {
+    case 'vmess': {
+      const obj = { ...node.vmess };
+      obj.ps = node.name;
+      obj.add = node.server;
+      obj.port = String(node.port);
+      return `vmess://${b64encode(JSON.stringify(obj))}`;
+    }
+    case 'vless': {
+      const qs = stringifyQuery(node.params);
+      return `vless://${encodeURIComponent(node.uuid)}@${server}${portPart}${node.urlPath}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'trojan': {
+      const qs = stringifyQuery(node.params);
+      return `trojan://${encodeURIComponent(node.password)}@${server}${portPart}${node.urlPath}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'ss': {
+      const qs = stringifyQuery(node.params);
+      const userinfo = b64encode(`${node.cipher}:${node.password}`).replace(/=+$/, '');
+      return `ss://${userinfo}@${server}${portPart}/${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'hysteria2': {
+      const qs = stringifyQuery(node.params);
+      return `hysteria2://${encodeURIComponent(node.password)}@${server}${portPart}${node.urlPath}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'hysteria': {
+      const qs = stringifyQuery(node.params);
+      const ui = node.userinfo ? `${node.userinfo}@` : '';
+      return `hysteria://${ui}${server}${portPart}${node.urlPath}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'tuic': {
+      const qs = stringifyQuery(node.params);
+      const ui = node.password
+        ? `${encodeURIComponent(node.uuid)}:${encodeURIComponent(node.password)}`
+        : encodeURIComponent(node.uuid);
+      return `tuic://${ui}@${server}${portPart}${node.urlPath}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'snell': {
+      const qs = stringifyQuery(node.params);
+      const inner = `${node.cipher}:${node.password}@${node.server}${portPart}`;
+      const userinfo = b64encode(inner).replace(/=+$/, '');
+      return `snell://${userinfo}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'anytls': {
+      const qs = stringifyQuery(node.params);
+      return `anytls://${encodeURIComponent(node.password)}@${server}${portPart}${node.urlPath}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'wireguard': {
+      const qs = stringifyQuery(node.params);
+      return `wireguard://${encodeURIComponent(node.password)}@${server}${portPart}${node.urlPath}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'socks5': {
+      const qs = stringifyQuery(node.params);
+      const ui = node.uuid
+        ? `${encodeURIComponent(node.uuid)}${node.password ? ':' + encodeURIComponent(node.password) : ''}@`
+        : '';
+      return `socks5://${ui}${server}${portPart}${node.urlPath}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    case 'http': {
+      const qs = stringifyQuery(node.params);
+      const ui = node.uuid
+        ? `${encodeURIComponent(node.uuid)}${node.password ? ':' + encodeURIComponent(node.password) : ''}@`
+        : '';
+      return `http://${ui}${server}${portPart}${node.urlPath}${qs ? '?' + qs : ''}${nameFrag}`;
+    }
+    default:
+      return node.raw || '';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Clash YAML input parsing (minimal indentation-based parser for the
+// `proxies:` list only — enough for real-world subscription files)
+// ---------------------------------------------------------------------------
+
+function indentOf(line) {
+  let n = 0;
+  while (line[n] === ' ') n++;
+  return n;
+}
+
+function isBlankOrComment(line) {
+  const t = line.trim();
+  return t === '' || t.startsWith('#');
+}
+
+/** Remove a trailing ` # comment` that is not inside quotes. */
+function stripYamlComment(line) {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === "'" && !inDouble) inSingle = !inSingle;
+    else if (c === '"' && !inSingle) {
+      if (line[i - 1] !== '\\') inDouble = !inDouble;
+    } else if (c === '#' && !inSingle && !inDouble && i > 0 && /\s/.test(line[i - 1])) {
+      return line.slice(0, i).trimEnd();
+    }
+  }
+  return line;
+}
+
+function parseFlowList(str) {
+  const inner = str.trim().slice(1, -1).trim();
+  if (!inner) return [];
+  const items = [];
+  let cur = '';
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === "'" && !inDouble) inSingle = !inSingle;
+    else if (c === '"' && !inSingle) inDouble = !inDouble;
+    if (c === ',' && !inSingle && !inDouble) {
+      items.push(parseScalar(cur.trim()));
+      cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  if (cur.trim() !== '') items.push(parseScalar(cur.trim()));
+  return items;
+}
+
+function parseFlowMap(str) {
+  const inner = str.trim().slice(1, -1).trim();
+  const obj = {};
+  if (!inner) return obj;
+  let cur = '';
+  let inSingle = false;
+  let inDouble = false;
+  let depth = 0;
+  const parts = [];
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === "'" && !inDouble) inSingle = !inSingle;
+    else if (c === '"' && !inSingle) inDouble = !inDouble;
+    if (!inSingle && !inDouble) {
+      if (c === '[' || c === '{') depth++;
+      if (c === ']' || c === '}') depth--;
+      if (c === ',' && depth === 0) {
+        parts.push(cur);
+        cur = '';
+        continue;
+      }
+    }
+    cur += c;
+  }
+  if (cur.trim() !== '') parts.push(cur);
+  for (const part of parts) {
+    const idx = part.indexOf(':');
+    if (idx < 0) continue;
+    const k = part.slice(0, idx).trim().replace(/^['"]|['"]$/g, '');
+    obj[k] = parseScalar(part.slice(idx + 1).trim());
+  }
+  return obj;
+}
+
+function parseScalar(str) {
+  const s = String(str).trim();
+  if (s === '') return '';
+  if (s === 'true') return true;
+  if (s === 'false') return false;
+  if (s === 'null' || s === '~') return null;
+  if (/^-?\d+$/.test(s)) return parseInt(s, 10);
+  if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
+  if (s.startsWith('[') && s.endsWith(']')) return parseFlowList(s);
+  if (s.startsWith('{') && s.endsWith('}')) return parseFlowMap(s);
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+    try {
+      return JSON.parse(s);
+    } catch {
+      return s.slice(1, -1);
+    }
+  }
+  if (s.length >= 2 && s.startsWith("'") && s.endsWith("'")) {
+    return s.slice(1, -1).replace(/''/g, "'");
+  }
+  return s;
+}
+
+/**
+ * Recursive block parser. `lines` are pre-cleaned (tabs expanded, dash-map
+ * items split). Returns [value, nextIndex]. `minIndent` is the smallest
+ * indent this block may start at.
+ */
+function parseYamlBlock(lines, i, minIndent) {
+  // Skip blanks/comments.
+  while (i < lines.length && isBlankOrComment(lines[i])) i++;
+  if (i >= lines.length) return [null, i];
+  const firstIndent = indentOf(lines[i]);
+  if (firstIndent < minIndent) return [null, i];
+  const first = lines[i];
+
+  if (/^\s*-\s*($|[^\s])/.test(first)) {
+    // ---- LIST ----
+    const listIndent = firstIndent;
+    const arr = [];
+    while (i < lines.length) {
+      while (i < lines.length && isBlankOrComment(lines[i])) i++;
+      if (i >= lines.length) break;
+      const line = lines[i];
+      if (indentOf(line) !== listIndent || !/^\s*-/.test(line)) break;
+      const afterDash = line.slice(listIndent + 1);
+      const content = afterDash.replace(/^ /, '');
+      if (content.trim() === '') {
+        // Bare '-': nested block follows.
+        const [v, ni] = parseYamlBlock(lines, i + 1, listIndent + 1);
+        arr.push(v);
+        i = ni;
+      } else if (/^(?:"[^"]*"|'[^']*'|[^:\s][^:]*)\s*:/.test(content)) {
+        // Map item whose first key is on the dash line: rewrite it as a
+        // nested map at indent+2 and parse it together with the siblings.
+        // `rewritten[0]` is the synthetic line standing in for lines[i],
+        // so rewritten index ni corresponds to original index i + ni.
+        const rewritten = [
+          ' '.repeat(listIndent + 2) + content,
+          ...lines.slice(i + 1),
+        ];
+        const [v, ni] = parseYamlBlock(rewritten, 0, listIndent + 2);
+        arr.push(v);
+        i = i + ni;
+      } else {
+        arr.push(parseScalar(stripYamlComment(content)));
+        i++;
+      }
+    }
+    return [arr, i];
+  }
+
+  // ---- MAP ----
+  const mapIndent = firstIndent;
+  const obj = {};
+  while (i < lines.length) {
+    while (i < lines.length && isBlankOrComment(lines[i])) i++;
+    if (i >= lines.length) break;
+    const line = lines[i];
+    if (indentOf(line) !== mapIndent) break;
+    if (/^\s*-/.test(line)) break;
+    const m = line.match(/^\s*([^:]+):\s*(.*)$/);
+    if (!m) break;
+    const key = m[1].trim().replace(/^['"]|['"]$/g, '');
+    const rest = stripYamlComment(m[2]).trim();
+    if (rest === '' || rest === '|' || rest === '>') {
+      const [v, ni] = parseYamlBlock(lines, i + 1, mapIndent + 1);
+      obj[key] = v;
+      i = ni;
+    } else {
+      obj[key] = parseScalar(rest);
+      i++;
+    }
+  }
+  return [obj, i];
+}
+
+/** Extract the `proxies:` list from a Clash YAML document. */
+function extractClashProxies(text) {
+  const rawLines = String(text)
+    .replace(/\t/g, '  ')
+    .split(/\r?\n/);
+  let start = -1;
+  for (let i = 0; i < rawLines.length; i++) {
+    if (/^proxies:\s*(#.*)?$/.test(rawLines[i])) {
+      start = i + 1;
+      break;
+    }
+  }
+  if (start < 0) return [];
+  // Collect until the next top-level key (indent 0).
+  const block = [];
+  for (let i = start; i < rawLines.length; i++) {
+    const line = rawLines[i];
+    if (line.trim() !== '' && !line.startsWith('#') && indentOf(line) === 0) break;
+    block.push(line);
+  }
+  const [value] = parseYamlBlock(block, 0, 0);
+  return Array.isArray(value) ? value : [];
+}
+
+/** Convert one Clash proxy dict into a normalized node (or null). */
+function clashProxyToNode(p) {
+  if (!p || typeof p !== 'object') return null;
+  const type = String(p.type || '').toLowerCase();
+  const protocolMap = {
+    vless: 'vless', vmess: 'vmess', trojan: 'trojan',
+    ss: 'ss', shadowsocks: 'ss', hysteria: 'hysteria',
+    hysteria2: 'hysteria2', tuic: 'tuic', snell: 'snell',
+    anytls: 'anytls', wireguard: 'wireguard',
+    socks5: 'socks5', socks: 'socks5', http: 'http',
+  };
+  const protocol = protocolMap[type];
+  if (!protocol || !p.server || !p.port) return null;
+
+  const node = newNode(protocol);
+  node.raw = '';
+  node.modified = true; // rebuild links from the normalized form
+  node.name = String(p.name || '');
+  node.server = String(p.server);
+  node.port = parseInt(p.port, 10) || 0;
+  node.uuid = String(p.uuid || '');
+  node.password = String(p.password || p.psk || '');
+  node.cipher = String(p.cipher || '');
+  node.tls = p.tls === true;
+  node.sni = String(p.servername || p.sni || '');
+  node.type = String(p.network || 'tcp');
+  node.alpn = Array.isArray(p.alpn) ? p.alpn.join(',') : String(p.alpn || '');
+  node.fingerprint = String(p['client-fingerprint'] || p.fingerprint || '');
+  node.flow = String(p.flow || '');
+
+  // Transport details (ws / grpc / xhttp / h2).
+  const wsOpts = p['ws-opts'] || {};
+  const grpcOpts = p['grpc-opts'] || {};
+  const xhttpOpts = p['xhttp-opts'] || {};
+  const headers = wsOpts.headers || xhttpOpts.headers || {};
+  node.host = String(headers.Host || headers.host || p.host || '');
+  node.path = String(
+    wsOpts.path || xhttpOpts.path || grpcOpts['grpc-service-name'] || p.path || '',
+  );
+  if (node.type === 'ws' && wsOpts['early-data-header-name']) {
+    node.params['eh'] = wsOpts['early-data-header-name'];
+  }
+
+  const params = {};
+  if (node.tls) params.security = 'tls';
+  if (node.type) params.type = node.type;
+  if (node.host) params.host = node.host;
+  if (node.path) params.path = node.path;
+  if (node.sni) params.sni = node.sni;
+  if (node.alpn) params.alpn = node.alpn;
+  if (node.fingerprint) params.fp = node.fingerprint;
+  if (node.flow) params.flow = node.flow;
+  const reality = p['reality-opts'] || {};
+  if (reality['public-key']) params.pbk = reality['public-key'];
+  if (reality['short-id']) params.sid = reality['short-id'];
+  if (p['skip-cert-verify']) params.allowInsecure = '1';
+  if (p['packet-encoding']) params.packetEncoding = p['packet-encoding'];
+  if (p['udp-over-tcp']) params.udpOverTcp = 'true';
+  if (p['ip-version']) params.ipVersion = p['ip-version'];
+  if (p['underlying-proxy']) params.dialerProxy = p['underlying-proxy'];
+
+  switch (protocol) {
+    case 'vmess': {
+      node.cipher = String(p.cipher || 'auto');
+      node.vmess = {
+        v: '2', ps: node.name, add: node.server, port: String(node.port),
+        id: node.uuid, aid: String(p.alterId || 0), scy: node.cipher,
+        net: node.type, type: String(p['http-opts']?.method || ''),
+        host: node.host, path: node.path,
+        tls: node.tls ? 'tls' : '', sni: node.sni,
+        alpn: node.alpn, fp: node.fingerprint,
+      };
+      node.params = { aid: node.vmess.aid };
+      break;
+    }
+    case 'ss': {
+      if (p.plugin) params.plugin = pluginToString(p.plugin, p['plugin-opts']);
+      node.params = params;
+      break;
+    }
+    case 'hysteria': {
+      node.userinfo = node.password;
+      if (p.auth_str) params.auth = p.auth_str;
+      if (p.protocol) params.protocol = p.protocol;
+      if (p.up) params.up = String(p.up);
+      if (p.down) params.down = String(p.down);
+      node.params = params;
+      break;
+    }
+    case 'hysteria2': {
+      if (p.up) params.up = String(p.up);
+      if (p.down) params.down = String(p.down);
+      if (p.obfs) params.obfs = p.obfs;
+      if (p['obfs-password']) params.obfsPassword = p['obfs-password'];
+      node.params = params;
+      break;
+    }
+    case 'tuic': {
+      if (p['congestion-controller']) params.congestion_control = p['congestion-controller'];
+      if (p['udp-relay-mode']) params.udp_relay_mode = p['udp-relay-mode'];
+      if (p['reduce-rtt']) params.reduce_rtt = '1';
+      if (p['heartbeat-interval']) params.heartbeat_interval = String(p['heartbeat-interval']);
+      node.params = params;
+      break;
+    }
+    case 'snell': {
+      if (p.version) params.version = String(p.version);
+      if (p.mode) params.mode = p.mode;
+      node.cipher = String(p.cipher || '');
+      node.params = params;
+      break;
+    }
+    case 'anytls': {
+      node.params = params;
+      break;
+    }
+    case 'wireguard': {
+      node.password = String(p['private-key'] || '');
+      params.publicKey = String(p['public-key'] || '');
+      if (p['pre-shared-key']) params.presharedKey = p['pre-shared-key'];
+      if (p.ip) params.address = p.ip;
+      if (p.ipv6) params.address = [params.address, p.ipv6].filter(Boolean).join(',');
+      if (p['allowed-ips']) params.allowedIPs = p['allowed-ips'].join(',');
+      if (p['persistent-keepalive']) params.keepalive = String(p['persistent-keepalive']);
+      if (p.mtu) params.mtu = String(p.mtu);
+      if (p.reserved) params.reserved = p.reserved.join(',');
+      node.params = params;
+      break;
+    }
+    case 'socks5':
+    case 'http': {
+      node.params = params;
+      break;
+    }
+    default: {
+      node.params = params;
+    }
+  }
+  return node;
+}
+
+function pluginToString(plugin, opts) {
+  if (!plugin) return '';
+  if (!opts || typeof opts !== 'object') return String(plugin);
+  const kv = Object.entries(opts).map(([k, v]) => `${k}=${v}`).join(';');
+  return kv ? `${plugin};${kv}` : String(plugin);
+}
+
+/** Parse a Clash YAML subscription into normalized nodes. */
+function parseClashText(text) {
+  const nodes = [];
+  for (const proxy of extractClashProxies(text)) {
+    const node = clashProxyToNode(proxy);
+    if (node) nodes.push(node);
+  }
+  return nodes;
+}
+
+// ---------------------------------------------------------------------------
+// sing-box JSON input parsing
+// ---------------------------------------------------------------------------
+
+/** Convert one sing-box outbound into a normalized node (or null). */
+function singboxOutboundToNode(o) {
+  if (!o || typeof o !== 'object') return null;
+  const skip = new Set(['selector', 'urltest', 'direct', 'block', 'dns']);
+  if (skip.has(o.type)) return null;
+  const typeMap = {
+    vless: 'vless', vmess: 'vmess', trojan: 'trojan',
+    shadowsocks: 'ss', hysteria: 'hysteria', hysteria2: 'hysteria2',
+    tuic: 'tuic', snell: 'snell', anytls: 'anytls',
+    wireguard: 'wireguard', socks: 'socks5', http: 'http',
+  };
+  const protocol = typeMap[o.type];
+  if (!protocol || !o.server || !o.server_port) return null;
+
+  const node = newNode(protocol);
+  node.raw = '';
+  node.modified = true;
+  node.name = String(o.tag || '');
+  node.server = String(o.server);
+  node.port = parseInt(o.server_port, 10) || 0;
+  node.uuid = String(o.uuid || '');
+  node.password = String(o.password || o.psk || '');
+  node.cipher = String(o.method || '');
+  const tls = o.tls || {};
+  node.tls = tls.enabled === true;
+  node.sni = String(tls.server_name || '');
+  node.type = String(o.network || 'tcp');
+  node.alpn = Array.isArray(tls.alpn) ? tls.alpn.join(',') : String(tls.alpn || '');
+  node.fingerprint = String(tls.utls?.fingerprint || '');
+  node.flow = String(o.flow || '');
+
+  const transport = o.transport || {};
+  node.type = String(transport.type || node.type);
+  if (transport.type === 'ws' || transport.type === 'httpupgrade' || transport.type === 'xhttp') {
+    node.host = String(transport.headers?.Host || transport.headers?.host || '');
+    node.path = String(transport.path || '');
+  } else if (transport.type === 'grpc') {
+    node.path = String(transport.service_name || '');
+  }
+
+  const params = {};
+  if (node.tls) params.security = 'tls';
+  if (node.type) params.type = node.type;
+  if (node.host) params.host = node.host;
+  if (node.path) params.path = node.path;
+  if (node.sni) params.sni = node.sni;
+  if (node.alpn) params.alpn = node.alpn;
+  if (node.fingerprint) params.fp = node.fingerprint;
+  if (node.flow) params.flow = node.flow;
+  if (tls.insecure) params.allowInsecure = '1';
+  if (tls.reality?.public_key) params.pbk = tls.reality.public_key;
+  if (tls.reality?.short_id) params.sid = tls.reality.short_id;
+  if (o.packet_encoding) params.packetEncoding = o.packet_encoding;
+  if (o.udp_over_tcp) params.udpOverTcp = 'true';
+
+  switch (protocol) {
+    case 'vmess': {
+      node.cipher = String(o.security || 'auto');
+      node.vmess = {
+        v: '2', ps: node.name, add: node.server, port: String(node.port),
+        id: node.uuid, aid: String(o.alter_id || 0), scy: node.cipher,
+        net: node.type, type: '', host: node.host, path: node.path,
+        tls: node.tls ? 'tls' : '', sni: node.sni,
+        alpn: node.alpn, fp: node.fingerprint,
+      };
+      node.params = { aid: node.vmess.aid };
+      break;
+    }
+    case 'ss': {
+      if (o.plugin) params.plugin = pluginToString(o.plugin, o.plugin_opts);
+      node.params = params;
+      break;
+    }
+    case 'hysteria': {
+      node.userinfo = node.password;
+      if (o.auth_str) params.auth = o.auth_str;
+      if (o.up_mbps) params.up = String(o.up_mbps);
+      if (o.down_mbps) params.down = String(o.down_mbps);
+      node.params = params;
+      break;
+    }
+    case 'hysteria2': {
+      if (o.up_mbps) params.up = String(o.up_mbps);
+      if (o.down_mbps) params.down = String(o.down_mbps);
+      if (o.obfs?.type) params.obfs = o.obfs.type;
+      if (o.obfs?.password) params.obfsPassword = o.obfs.password;
+      node.params = params;
+      break;
+    }
+    case 'tuic': {
+      if (o.congestion_control) params.congestion_control = o.congestion_control;
+      if (o.udp_relay_mode) params.udp_relay_mode = o.udp_relay_mode;
+      if (o.zero_rtt_handshake) params.reduce_rtt = '1';
+      if (o.heartbeat) params.heartbeat_interval = o.heartbeat;
+      node.params = params;
+      break;
+    }
+    case 'snell': {
+      if (o.version) params.version = String(o.version);
+      if (o.mode) params.mode = o.mode;
+      node.params = params;
+      break;
+    }
+    case 'wireguard': {
+      node.password = String(o.private_key || '');
+      params.publicKey = String(o.peer_public_key || '');
+      if (o.pre_shared_key) params.presharedKey = o.pre_shared_key;
+      if (o.local_address) params.address = o.local_address.join(',');
+      if (o.mtu) params.mtu = String(o.mtu);
+      if (o.persistent_keepalive) params.keepalive = String(o.persistent_keepalive);
+      if (o.reserved) params.reserved = o.reserved.join(',');
+      node.params = params;
+      break;
+    }
+    default: {
+      node.params = params;
+    }
+  }
+  return node;
+}
+
+/** Parse a sing-box JSON subscription into normalized nodes. */
+function parseSingboxText(text) {
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const outbounds = doc?.outbounds;
+  if (!Array.isArray(outbounds)) return [];
+  const nodes = [];
+  for (const o of outbounds) {
+    const node = singboxOutboundToNode(o);
+    if (node) nodes.push(node);
+  }
+  return nodes;
+}
+
+// ---------------------------------------------------------------------------
+// Line classification & subscription fetching
+// ---------------------------------------------------------------------------
+
+/**
+ * Classify one line from LINK / LINKSUB:
+ *  - 'node': a proxy link (vless://, vmess://, ... or an http(s) proxy link)
+ *  - 'sub' : an http(s) subscription URL to fetch
+ *  - 'ignore': anything else
+ * An http(s) URL is a proxy node only when it carries userinfo or a
+ * fragment (a name) — otherwise it is a subscription URL.
+ */
+function classifyLine(line) {
+  const t = String(line).trim();
+  if (!t || t.startsWith('#')) return 'ignore';
+  const schemeIdx = t.indexOf('://');
+  if (schemeIdx < 0) return 'ignore';
+  const scheme = t.slice(0, schemeIdx).toLowerCase();
+  if (scheme === 'http' || scheme === 'https') {
+    const parts = splitLink(t);
+    if (parts.userinfo || parts.fragment) return 'node';
+    return 'sub';
+  }
+  return NODE_SCHEMES.has(scheme) ? 'node' : 'ignore';
+}
+
+/** Parse a plaintext (or base64-decoded) link list into nodes. */
+function parseLinkList(text) {
+  const nodes = [];
+  let failed = 0;
+  for (const line of splitLines(text)) {
+    const t = line.trim();
+    if (!t || t.startsWith('#') || !t.includes('://')) continue;
+    const node = parseNode(t);
+    if (node) nodes.push(node);
+    else failed++;
+  }
+  return { nodes, failed };
+}
+
+/** Detect the format of a fetched subscription body and parse it. */
+function parseSubContent(text) {
+  const trimmed = String(text).trim();
+  if (!trimmed) return { nodes: [], failed: 0 };
+
+  // sing-box JSON: starts with '{' and has an outbounds array.
+  if (trimmed.startsWith('{')) {
+    try {
+      const doc = JSON.parse(trimmed);
+      if (Array.isArray(doc?.outbounds)) {
+        const nodes = parseSingboxText(trimmed);
+        return { nodes, failed: doc.outbounds.length - nodes.length };
+      }
+    } catch {
+      // fall through to the other formats
+    }
+  }
+
+  // Clash YAML: has a top-level `proxies:` key.
+  if (/^proxies:/m.test(trimmed)) {
+    const proxies = extractClashProxies(trimmed);
+    const nodes = parseClashText(trimmed);
+    return { nodes, failed: Math.max(0, proxies.length - nodes.length) };
+  }
+
+  // Base64-encoded link list.
+  if (looksLikeBase64Sub(trimmed)) {
+    const decoded = b64decode(trimmed.replace(/\s/g, ''));
+    if (decoded) return parseLinkList(decoded);
+  }
+
+  // Plaintext link list.
+  return parseLinkList(trimmed);
+}
+
+/** Fetch one subscription URL with a timeout. Returns text or null. */
+async function fetchOneSub(url, userAgent) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': userAgent || 'Cloudflare-Omni/1.0',
+        Accept: 'text/plain, */*',
+      },
+      redirect: 'follow',
+    });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null; // timeout / network error: skip, never abort the whole run
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Aggregate every node from LINK (direct node links) and LINKSUB
+ * (subscription URLs, fetched in parallel). Returns { nodes, stats }.
+ */
+async function aggregateNodes(env, request) {
+  const stats = { direct: 0, subsOk: 0, subsFailed: 0, parseFailed: 0 };
+  const nodes = [];
+
+  const linkLines = splitLines(env.LINK || '');
+  const subLines = splitLines(env.LINKSUB || '');
+  const allLines = [...linkLines, ...subLines];
+
+  const nodeLines = [];
+  const subUrls = [];
+  for (const line of allLines) {
+    const kind = classifyLine(line);
+    if (kind === 'node') nodeLines.push(line);
+    else if (kind === 'sub') subUrls.push(line);
+  }
+
+  // Direct node links.
+  for (const line of nodeLines) {
+    const node = parseNode(line);
+    if (node) nodes.push(node);
+    else stats.parseFailed++;
+  }
+  stats.direct = nodes.length;
+
+  // Subscription URLs, fetched in parallel (8s timeout each, failures skip).
+  const uniqueSubs = [...new Set(subUrls)];
+  if (uniqueSubs.length > 0) {
+    const ua = request.headers.get('User-Agent') || '';
+    const results = await Promise.allSettled(
+      uniqueSubs.map((u) => fetchOneSub(u, ua)),
+    );
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.status !== 'fulfilled' || !r.value) {
+        stats.subsFailed++;
+        continue;
+      }
+      const { nodes: subNodes, failed } = parseSubContent(r.value);
+      stats.subsOk++;
+      stats.parseFailed += failed;
+      nodes.push(...subNodes);
+    }
+  }
+
+  return { nodes, stats };
+}
+
+// ---------------------------------------------------------------------------
+// Dedupe & edgeTunnel preferred-IP / preferred-domain replacement
+// ---------------------------------------------------------------------------
+
+/** Dedupe by protocol + server + port + credential; rename same names. */
+function dedupeNodes(nodes) {
+  const seen = new Set();
+  const nameCount = new Map();
+  const out = [];
+  for (const node of nodes) {
+    const cred = node.uuid || node.password || '';
+    const key = `${node.protocol}|${node.server.toLowerCase()}|${node.port}|${cred}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    // Same display name used twice: append a numeric suffix.
+    if (!node.name) node.name = `${node.protocol}-${node.server}`;
+    const base = node.name;
+    const count = (nameCount.get(base) || 0) + 1;
+    nameCount.set(base, count);
+    if (count > 1) {
+      node.name = `${base} (${count})`;
+      node.modified = true;
+    }
+    out.push(node);
+  }
+  return out;
+}
+
+/** Is this node hosted on an edgeTunnel (Cloudflare) endpoint? */
+function isEdgeTunnel(node, edgeHosts) {
+  const server = String(node.server || '').toLowerCase();
+  if (!server) return false;
+  for (const suffix of BUILTIN_EDGE_SUFFIXES) {
+    if (server.endsWith(suffix)) return true;
+  }
+  for (const h of edgeHosts) {
+    const host = h.toLowerCase();
+    if (server === host || server.endsWith(`.${host}`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Preferred IP / domain replacement, edgeTunnel nodes only.
+ * - `ip` wins as the connect address when both ip and domain are given.
+ * - The original domain is kept as the TLS SNI (set when missing) and as
+ *   the Host header for ws / xhttp / httpupgrade / grpc transports.
+ * - Renames the node with a "(优选)" suffix only when a replacement happened.
+ */
+function applyPrefer(nodes, preferIp, preferDomain, edgeHosts) {
+  const ip = (preferIp || '').trim();
+  const domain = (preferDomain || '').trim();
+  if (!ip && !domain) return nodes;
+  const target = ip || domain;
+  const tlsProtocols = new Set([
+    'vless', 'vmess', 'trojan', 'hysteria', 'hysteria2', 'tuic', 'anytls',
+  ]);
+  const hostTransports = new Set(['ws', 'xhttp', 'httpupgrade', 'grpc']);
+
+  for (const node of nodes) {
+    if (!isEdgeTunnel(node, edgeHosts)) continue;
+    const originalDomain = node.server;
+    if (!originalDomain || originalDomain === target) continue;
+    node.server = target;
+    node.modified = true;
+    node.preferApplied = true;
+    // Keep the original domain as TLS SNI (set it when the node has none).
+    if (tlsProtocols.has(node.protocol) && !node.sni) {
+      setNodeField(node, 'sni', originalDomain);
+    }
+    // Keep the original domain as the Host header for HTTP-based transports.
+    if (hostTransports.has(node.type) && !node.host) {
+      setNodeField(node, 'host', originalDomain);
+    }
+    if (!node.name.endsWith('(优选)')) {
+      node.name = `${node.name}(优选)`;
+    }
+  }
+  return nodes;
+}
+
+// ---------------------------------------------------------------------------
+// Output rendering
+// ---------------------------------------------------------------------------
+
+/** Resolve the output format: ?target= wins, then shorthand flags, then UA. */
+function resolveTarget(url, userAgent) {
+  const t = (url.searchParams.get('target') || '').trim().toLowerCase();
+  if (t) return t;
+  const p = url.searchParams;
+  if (p.has('clash')) return 'clash';
+  if (p.has('singbox') || p.has('sb')) return 'singbox';
+  if (p.has('surge')) return 'surge';
+  if (p.has('quanx') || p.has('quantumultx')) return 'quanx';
+  if (p.has('loon')) return 'loon';
+  if (p.has('b64') || p.has('base64')) return 'base64';
+  if (p.has('raw')) return 'raw';
+  const ua = (userAgent || '').toLowerCase();
+  if (ua.includes('clash') || ua.includes('mihomo') || ua.includes('stash')) return 'clash';
+  if (ua.includes('sing-box') || ua.includes('singbox')) return 'singbox';
+  if (ua.includes('surge')) return 'surge';
+  if (ua.includes('quantumult')) return 'quanx';
+  if (ua.includes('loon')) return 'loon';
+  if (ua.includes('shadowrocket')) return 'shadowrocket';
+  return 'base64';
+}
+
+/** All node links, one per line. */
+function toRaw(nodes) {
+  return nodes.map((n) => buildLink(n)).filter(Boolean).join('\n');
+}
+
+/** Base64-encoded node list (the default subscription format). */
+function toBase64(nodes) {
+  return b64encode(toRaw(nodes));
+}
+
+/** Common subscription response headers. */
+function subHeaders(env, userAgent, extra = {}) {
+  const uptime = parseInt(env.SUBUPTIME, 10);
+  const hours = Number.isFinite(uptime) && uptime > 0 ? uptime : DEFAULT_UPTIME_HOURS;
+  const headers = {
+    'Profile-Update-Interval': String(hours),
+    'Subscription-Userinfo':
+      `upload=0; download=0; total=${SUB_TOTAL_BYTES}; expire=${SUB_EXPIRE_TS}`,
+    ...extra,
+  };
+  // Offer a download filename to real clients, not to browsers.
+  if (!String(userAgent || '').toLowerCase().includes('mozilla')) {
+    const name = encodeURIComponent(env.SUBNAME || DEFAULT_SUBNAME);
+    headers['Content-Disposition'] = `attachment; filename*=utf-8''${name}`;
+  }
+  return headers;
+}
+
+/** Transport options block shared by the Clash proxy emitters. */
+function clashTransport(node) {
+  const lines = [];
+  const host = node.host;
+  const path = node.path;
+  if (node.type === 'ws' || node.type === 'httpupgrade') {
+    lines.push('    ws-opts:');
+    if (path) lines.push(`      path: ${yamlScalar(path)}`);
+    if (host) {
+      lines.push('      headers:');
+      lines.push(`        Host: ${yamlScalar(host)}`);
+    }
+  } else if (node.type === 'grpc') {
+    lines.push('    grpc-opts:');
+    if (path) lines.push(`      grpc-service-name: ${yamlScalar(path)}`);
+  } else if (node.type === 'xhttp') {
+    lines.push('    xhttp-opts:');
+    if (path) lines.push(`      path: ${yamlScalar(path)}`);
+    if (host) {
+      lines.push('      headers:');
+      lines.push(`        Host: ${yamlScalar(host)}`);
+    }
+  } else if (node.type === 'h2') {
+    lines.push('    h2-opts:');
+    if (host) lines.push(`      host: [${yamlScalar(host)}]`);
+    if (path) lines.push(`      path: ${yamlScalar(path)}`);
+  }
+  return lines.join('\n');
+}
+
+/** One Clash proxy entry (YAML block) for a normalized node. */
+function clashProxy(node) {
+  const L = [];
+  L.push(`  - name: ${yamlScalar(node.name)}`);
+  L.push(`    type: ${node.protocol}`);
+  L.push(`    server: ${yamlScalar(node.server)}`);
+  L.push(`    port: ${node.port}`);
+  const allowInsecure = node.params.allowInsecure === '1';
+  const alpnList = node.alpn ? node.alpn.split(',').map((s) => s.trim()).filter(Boolean) : [];
+  const tlsBlock = () => {
+    if (node.sni) L.push(`    sni: ${yamlScalar(node.sni)}`);
+    if (alpnList.length) L.push(`    alpn: [${alpnList.map(yamlScalar).join(', ')}]`);
+    if (node.fingerprint) L.push(`    client-fingerprint: ${yamlScalar(node.fingerprint)}`);
+    if (allowInsecure) L.push('    skip-cert-verify: true');
+  };
+
+  switch (node.protocol) {
+    case 'vless': {
+      L.push(`    uuid: ${yamlScalar(node.uuid)}`);
+      if (node.flow) L.push(`    flow: ${yamlScalar(node.flow)}`);
+      L.push(`    network: ${yamlScalar(node.type)}`);
+      L.push(`    tls: ${node.tls ? 'true' : 'false'}`);
+      if (node.tls) {
+        if (node.sni) L.push(`    servername: ${yamlScalar(node.sni)}`);
+        tlsBlock();
+      }
+      if (node.params.pbk) {
+        L.push('    reality-opts:');
+        L.push(`      public-key: ${yamlScalar(node.params.pbk)}`);
+        if (node.params.sid) L.push(`      short-id: ${yamlScalar(node.params.sid)}`);
+      }
+      if (node.params.packetEncoding) L.push(`    packet-encoding: ${yamlScalar(node.params.packetEncoding)}`);
+      L.push('    udp: true');
+      const t = clashTransport(node);
+      if (t) L.push(t);
+      break;
+    }
+    case 'vmess': {
+      L.push(`    uuid: ${yamlScalar(node.uuid)}`);
+      const aid = node.vmess?.aid ?? node.params.aid ?? 0;
+      L.push(`    alterId: ${aid}`);
+      L.push(`    cipher: ${yamlScalar(node.cipher || 'auto')}`);
+      L.push(`    network: ${yamlScalar(node.type)}`);
+      L.push(`    tls: ${node.tls ? 'true' : 'false'}`);
+      if (node.tls) {
+        if (node.sni) L.push(`    servername: ${yamlScalar(node.sni)}`);
+        tlsBlock();
+      }
+      L.push('    udp: true');
+      const t = clashTransport(node);
+      if (t) L.push(t);
+      break;
+    }
+    case 'trojan': {
+      L.push(`    password: ${yamlScalar(node.password)}`);
+      L.push(`    network: ${yamlScalar(node.type)}`);
+      if (node.sni) L.push(`    sni: ${yamlScalar(node.sni)}`);
+      if (alpnList.length) L.push(`    alpn: [${alpnList.map(yamlScalar).join(', ')}]`);
+      if (node.fingerprint) L.push(`    client-fingerprint: ${yamlScalar(node.fingerprint)}`);
+      if (allowInsecure) L.push('    skip-cert-verify: true');
+      L.push('    udp: true');
+      const t = clashTransport(node);
+      if (t) L.push(t);
+      break;
+    }
+    case 'ss': {
+      L.push(`    cipher: ${yamlScalar(node.cipher)}`);
+      L.push(`    password: ${yamlScalar(node.password)}`);
+      L.push('    udp: true');
+      if (node.params.plugin) {
+        const [plugin, ...rest] = node.params.plugin.split(';');
+        L.push(`    plugin: ${yamlScalar(plugin)}`);
+        if (rest.length) {
+          L.push('    plugin-opts:');
+          for (const kv of rest) {
+            const eq = kv.indexOf('=');
+            if (eq > 0) L.push(`      ${kv.slice(0, eq)}: ${yamlScalar(kv.slice(eq + 1))}`);
+          }
+        }
+      }
+      break;
+    }
+    case 'hysteria2': {
+      L.push(`    password: ${yamlScalar(node.password)}`);
+      if (node.sni) L.push(`    sni: ${yamlScalar(node.sni)}`);
+      if (alpnList.length) L.push(`    alpn: [${alpnList.map(yamlScalar).join(', ')}]`);
+      if (node.params.up) L.push(`    up: ${yamlScalar(node.params.up)}`);
+      if (node.params.down) L.push(`    down: ${yamlScalar(node.params.down)}`);
+      if (node.params.obfs) L.push(`    obfs: ${yamlScalar(node.params.obfs)}`);
+      if (node.params.obfsPassword) L.push(`    obfs-password: ${yamlScalar(node.params.obfsPassword)}`);
+      if (allowInsecure) L.push('    skip-cert-verify: true');
+      break;
+    }
+    case 'hysteria': {
+      L.push(`    auth_str: ${yamlScalar(node.password)}`);
+      if (node.params.protocol) L.push(`    protocol: ${yamlScalar(node.params.protocol)}`);
+      if (node.sni) L.push(`    sni: ${yamlScalar(node.sni)}`);
+      if (alpnList.length) L.push(`    alpn: [${alpnList.map(yamlScalar).join(', ')}]`);
+      if (node.params.up) L.push(`    up: ${yamlScalar(node.params.up)}`);
+      if (node.params.down) L.push(`    down: ${yamlScalar(node.params.down)}`);
+      if (allowInsecure) L.push('    skip-cert-verify: true');
+      break;
+    }
+    case 'tuic': {
+      L.push(`    uuid: ${yamlScalar(node.uuid)}`);
+      L.push(`    password: ${yamlScalar(node.password)}`);
+      if (node.sni) L.push(`    sni: ${yamlScalar(node.sni)}`);
+      if (alpnList.length) L.push(`    alpn: [${alpnList.map(yamlScalar).join(', ')}]`);
+      if (node.params.congestion_control) L.push(`    congestion-controller: ${yamlScalar(node.params.congestion_control)}`);
+      if (node.params.udp_relay_mode) L.push(`    udp-relay-mode: ${yamlScalar(node.params.udp_relay_mode)}`);
+      if (node.params.reduce_rtt) L.push('    reduce-rtt: true');
+      if (node.params.heartbeat_interval) L.push(`    heartbeat-interval: ${yamlScalar(node.params.heartbeat_interval)}`);
+      if (allowInsecure) L.push('    skip-cert-verify: true');
+      break;
+    }
+    case 'snell': {
+      L.push(`    psk: ${yamlScalar(node.password)}`);
+      const version = parseInt(node.params.version, 10) || 4;
+      L.push(`    version: ${version}`);
+      if (version === 6 && node.params.mode) L.push(`    mode: ${yamlScalar(node.params.mode)}`);
+      L.push('    udp: true');
+      L.push('    reuse: true');
+      break;
+    }
+    case 'anytls': {
+      L.push(`    password: ${yamlScalar(node.password)}`);
+      if (node.sni) L.push(`    sni: ${yamlScalar(node.sni)}`);
+      if (alpnList.length) L.push(`    alpn: [${alpnList.map(yamlScalar).join(', ')}]`);
+      if (allowInsecure) L.push('    skip-cert-verify: true');
+      break;
+    }
+    case 'wireguard': {
+      const addrs = (node.params.address || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const v4 = addrs.find((a) => !a.includes(':'));
+      const v6 = addrs.find((a) => a.includes(':'));
+      if (v4) L.push(`    ip: ${yamlScalar(v4)}`);
+      if (v6) L.push(`    ipv6: ${yamlScalar(v6)}`);
+      if (node.params.publicKey) L.push(`    public-key: ${yamlScalar(node.params.publicKey)}`);
+      L.push(`    private-key: ${yamlScalar(node.password)}`);
+      if (node.params.presharedKey) L.push(`    pre-shared-key: ${yamlScalar(node.params.presharedKey)}`);
+      if (node.params.allowedIPs) {
+        const ips = node.params.allowedIPs.split(',').map((s) => s.trim()).filter(Boolean);
+        L.push(`    allowed-ips: [${ips.map(yamlScalar).join(', ')}]`);
+      }
+      if (node.params.keepalive) L.push(`    persistent-keepalive: ${node.params.keepalive}`);
+      if (node.params.mtu) L.push(`    mtu: ${node.params.mtu}`);
+      L.push('    udp: true');
+      break;
+    }
+    case 'socks5': {
+      if (node.uuid) L.push(`    username: ${yamlScalar(node.uuid)}`);
+      if (node.password) L.push(`    password: ${yamlScalar(node.password)}`);
+      if (node.tls) L.push('    tls: true');
+      if (allowInsecure) L.push('    skip-cert-verify: true');
+      L.push('    udp: true');
+      break;
+    }
+    case 'http': {
+      if (node.uuid) L.push(`    username: ${yamlScalar(node.uuid)}`);
+      if (node.password) L.push(`    password: ${yamlScalar(node.password)}`);
+      if (node.tls) L.push('    tls: true');
+      if (node.sni) L.push(`    sni: ${yamlScalar(node.sni)}`);
+      if (allowInsecure) L.push('    skip-cert-verify: true');
+      break;
+    }
+    default: {
+      // Unknown protocol: emit the common fields only.
+      break;
+    }
+  }
+  return L.join('\n');
+}
+
+/** Native Clash / Mihomo YAML: proxies + select + url-test + basic rules. */
+function toClash(nodes) {
+  const names = nodes.map((n) => n.name);
+  const lines = [];
+  lines.push('# Generated by Cloudflare-Omni');
+  lines.push('mixed-port: 7890');
+  lines.push('allow-lan: false');
+  lines.push('mode: rule');
+  lines.push('log-level: info');
+  lines.push('ipv6: true');
+  lines.push('dns:');
+  lines.push('  enable: true');
+  lines.push('  nameserver:');
+  lines.push('    - 223.5.5.5');
+  lines.push('    - 8.8.8.8');
+  lines.push('proxies:');
+  for (const node of nodes) lines.push(clashProxy(node));
+  lines.push('proxy-groups:');
+  lines.push(`  - name: ${yamlScalar(SELECT_GROUP)}`);
+  lines.push('    type: select');
+  lines.push('    proxies:');
+  for (const n of names) lines.push(`      - ${yamlScalar(n)}`);
+  lines.push(`      - ${yamlScalar(URLTEST_GROUP)}`);
+  lines.push(`  - name: ${yamlScalar(URLTEST_GROUP)}`);
+  lines.push('    type: url-test');
+  lines.push(`    url: ${URLTEST_URL}`);
+  lines.push('    interval: 300');
+  lines.push('    tolerance: 50');
+  lines.push('    proxies:');
+  for (const n of names) lines.push(`      - ${yamlScalar(n)}`);
+  lines.push('rules:');
+  lines.push('  - GEOSITE,category-ads-all,REJECT');
+  lines.push('  - GEOSITE,cn,DIRECT');
+  lines.push('  - GEOIP,CN,DIRECT');
+  lines.push('  - GEOIP,private,DIRECT');
+  lines.push(`  - MATCH,${SELECT_GROUP}`);
+  return lines.join('\n') + '\n';
+}
+
+// --- sing-box outbounds ----------------------------------------------------
+
+/** sing-box transport object for a normalized node (or undefined). */
+function singboxTransport(node) {
+  const headers = node.host ? { Host: node.host } : undefined;
+  switch (node.type) {
+    case 'ws':
+      return { type: 'ws', path: node.path || '/', headers };
+    case 'grpc':
+      return { type: 'grpc', service_name: node.path || '' };
+    case 'xhttp':
+      return { type: 'xhttp', path: node.path || '/', headers };
+    case 'httpupgrade':
+      return { type: 'httpupgrade', path: node.path || '/', headers };
+    case 'h2':
+      return { type: 'http', path: node.path || '/', headers };
+    default:
+      return undefined;
+  }
+}
+
+/** sing-box TLS object for a normalized node (or undefined). */
+function singboxTls(node) {
+  if (!node.tls) return undefined;
+  const tls = { enabled: true };
+  if (node.sni) tls.server_name = node.sni;
+  if (node.params.allowInsecure === '1') tls.insecure = true;
+  if (node.alpn) tls.alpn = node.alpn.split(',').map((s) => s.trim()).filter(Boolean);
+  if (node.fingerprint) tls.utls = { enabled: true, fingerprint: node.fingerprint };
+  if (node.params.pbk) {
+    tls.reality = {
+      enabled: true,
+      public_key: node.params.pbk,
+      short_id: node.params.sid || '',
+    };
+  }
+  return tls;
+}
+
+/** One sing-box outbound object for a normalized node (or null). */
+function singboxOutbound(node) {
+  const base = { tag: node.name, server: node.server, server_port: node.port };
+  const transport = singboxTransport(node);
+  const tls = singboxTls(node);
+  const withNet = (obj) => {
+    if (node.type && node.type !== 'tcp') obj.network = node.type;
+    return obj;
+  };
+  switch (node.protocol) {
+    case 'vless': {
+      const o = { type: 'vless', ...base, uuid: node.uuid };
+      if (node.flow) o.flow = node.flow;
+      if (node.params.packetEncoding) o.packet_encoding = node.params.packetEncoding;
+      if (transport) o.transport = transport;
+      if (tls) o.tls = tls;
+      return withNet(o);
+    }
+    case 'vmess': {
+      const o = {
+        type: 'vmess', ...base, uuid: node.uuid,
+        alter_id: parseInt(node.vmess?.aid ?? node.params.aid ?? 0, 10) || 0,
+        security: node.cipher || 'auto',
+      };
+      if (transport) o.transport = transport;
+      if (tls) o.tls = tls;
+      return withNet(o);
+    }
+    case 'trojan': {
+      const o = { type: 'trojan', ...base, password: node.password };
+      if (transport) o.transport = transport;
+      if (tls) o.tls = tls;
+      return withNet(o);
+    }
+    case 'ss': {
+      const o = {
+        type: 'shadowsocks', ...base,
+        method: node.cipher, password: node.password,
+      };
+      if (node.params.udpOverTcp === 'true') o.udp_over_tcp = true;
+      if (node.params.plugin) {
+        const [plugin, ...rest] = node.params.plugin.split(';');
+        o.plugin = plugin;
+        if (rest.length) o.plugin_opts = rest.join(';');
+      }
+      return o;
+    }
+    case 'hysteria2': {
+      const o = { type: 'hysteria2', ...base, password: node.password };
+      if (tls) o.tls = tls;
+      if (node.params.obfs) o.obfs = { type: node.params.obfs, password: node.params.obfsPassword || '' };
+      if (node.params.up) o.up_mbps = parseInt(node.params.up, 10) || undefined;
+      if (node.params.down) o.down_mbps = parseInt(node.params.down, 10) || undefined;
+      return o;
+    }
+    case 'hysteria': {
+      const o = { type: 'hysteria', ...base, version: 1, auth_str: node.password };
+      if (tls) o.tls = tls;
+      if (node.params.up) o.up_mbps = parseInt(node.params.up, 10) || undefined;
+      if (node.params.down) o.down_mbps = parseInt(node.params.down, 10) || undefined;
+      return o;
+    }
+    case 'tuic': {
+      const o = { type: 'tuic', ...base, uuid: node.uuid, password: node.password };
+      if (tls) o.tls = tls;
+      if (node.params.congestion_control) o.congestion_control = node.params.congestion_control;
+      if (node.params.udp_relay_mode) o.udp_relay_mode = node.params.udp_relay_mode;
+      if (node.params.reduce_rtt) o.zero_rtt_handshake = true;
+      if (node.params.heartbeat_interval) o.heartbeat = node.params.heartbeat_interval;
+      return o;
+    }
+    case 'snell': {
+      const o = {
+        type: 'snell', ...base, psk: node.password,
+        version: parseInt(node.params.version, 10) || 4,
+      };
+      if (o.version === 6 && node.params.mode) o.mode = node.params.mode;
+      return o;
+    }
+    case 'anytls': {
+      const o = { type: 'anytls', ...base, password: node.password };
+      if (tls) o.tls = tls;
+      return o;
+    }
+    case 'wireguard': {
+      const o = {
+        type: 'wireguard', ...base,
+        local_address: (node.params.address || '').split(',').map((s) => s.trim()).filter(Boolean),
+        private_key: node.password,
+        peer_public_key: node.params.publicKey || '',
+      };
+      if (node.params.presharedKey) o.pre_shared_key = node.params.presharedKey;
+      if (node.params.mtu) o.mtu = parseInt(node.params.mtu, 10) || undefined;
+      if (node.params.keepalive) o.persistent_keepalive = parseInt(node.params.keepalive, 10) || undefined;
+      if (node.params.reserved) o.reserved = node.params.reserved.split(',').map((s) => parseInt(s.trim(), 10));
+      return o;
+    }
+    case 'socks5': {
+      const o = { type: 'socks', ...base, version: '5' };
+      if (node.uuid) o.username = node.uuid;
+      if (node.password) o.password = node.password;
+      return o;
+    }
+    case 'http': {
+      const o = { type: 'http', ...base };
+      if (node.uuid) o.username = node.uuid;
+      if (node.password) o.password = node.password;
+      if (tls) o.tls = tls;
+      return o;
+    }
+    default:
+      return null;
+  }
+}
+
+/** Native sing-box JSON: node outbounds + selector + urltest + direct + block. */
+function toSingbox(nodes) {
+  const outbounds = [];
+  for (const node of nodes) {
+    const o = singboxOutbound(node);
+    if (o) outbounds.push(o);
+  }
+  const names = outbounds.map((o) => o.tag);
+  outbounds.push({
+    type: 'selector', tag: SELECT_GROUP,
+    outbounds: [...names, URLTEST_GROUP],
+    default: names[0] || 'direct',
+  });
+  outbounds.push({
+    type: 'urltest', tag: URLTEST_GROUP,
+    outbounds: names, url: URLTEST_URL, interval: '5m', tolerance: 50,
+  });
+  outbounds.push({ type: 'direct', tag: 'direct' });
+  outbounds.push({ type: 'block', tag: 'block' });
+
+  const doc = {
+    log: { level: 'info', timestamp: true },
+    dns: {
+      servers: [
+        { tag: 'dns-remote', address: 'tls://8.8.8.8' },
+        { tag: 'dns-direct', address: '223.5.5.5', detour: 'direct' },
+      ],
+      rules: [
+        { outbound: 'any', server: 'dns-direct', domain_suffix: ['.cn'] },
+      ],
+      final: 'dns-remote',
+    },
+    // No local listeners: this is a pure outbound subscription.
+    inbounds: [],
+    outbounds,
+    route: {
+      rules: [
+        { action: 'route', outbound: 'block', geosite: 'category-ads-all' },
+        { action: 'route', outbound: 'direct', geosite: 'cn' },
+        { action: 'route', outbound: 'direct', geoip: ['cn', 'private'] },
+      ],
+      final: SELECT_GROUP,
+    },
+  };
+  return JSON.stringify(doc, null, 2);
+}
+
+// --- external converter backend (e.g. self-hosted psub) --------------------
+
+/** Normalize a SUBAPI value to a base URL (default scheme https). */
+function normalizeSubApi(subapi) {
+  let api = String(subapi || '').trim().replace(/\/+$/, '');
+  if (!api) return '';
+  if (!/^https?:\/\//i.test(api)) api = `https://${api}`;
+  return api;
+}
+
+/**
+ * Forward the aggregated subscription to an external converter backend.
+ * Returns { body, contentType } or null when the backend is unusable.
+ */
+async function forwardToConverter(target, selfUrl, env, userAgent) {
+  const api = normalizeSubApi(env.SUBAPI);
+  if (!api) return null;
+  const targetMap = {
+    surge: 'surge', quanx: 'quanx', quantumultx: 'quanx',
+    loon: 'loon', shadowrocket: 'shadowrocket',
+    clash: 'clash', singbox: 'singbox', mixed: 'mixed',
+  };
+  const t = targetMap[target] || target;
+  const q = new URLSearchParams({
+    target: t,
+    url: selfUrl,
+    insert: 'false',
+    emoji: 'false',
+    list: 'false',
+    tfo: 'false',
+    scv: 'true',
+    fdn: 'false',
+    sort: 'false',
+    new_name: 'true',
+  });
+  if (t === 'surge') q.set('ver', '4');
+  if (t === 'quanx') q.set('udp', 'true');
+  const convUrl = `${api}/sub?${q.toString()}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(convUrl, {
+      signal: controller.signal,
+      headers: { 'User-Agent': userAgent || 'Cloudflare-Omni/1.0' },
+    });
+    if (!res.ok) return null;
+    const body = await res.text();
+    if (!body || !body.trim()) return null;
+    return {
+      body,
+      contentType: res.headers.get('content-type') || 'text/plain; charset=utf-8',
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the set of accepted tokens for this request:
+ *  - the master TOKEN itself
+ *  - a fixed guest token: MD5(TOKEN)
+ *  - a daily guest token: MD5(TOKEN + UTC date "YYYY-MM-DD"), rotates daily
+ * Returns { all:Set, master, fixed, daily }.
+ */
+async function buildTokens(master) {
+  const fixed = await md5Hex(master);
+  const date = new Date().toISOString().slice(0, 10); // UTC date
+  const daily = await md5Hex(master + date);
+  return { all: new Set([master, fixed, daily]), master, fixed, daily };
+}
+
+/** Accept ?token=... or a token as the first path segment (/<token>). */
+function isAuthorized(url, tokens) {
+  const q = url.searchParams.get('token');
+  if (q && tokens.all.has(q)) return true;
+  const seg = url.pathname.split('/').filter(Boolean)[0];
+  if (seg && tokens.all.has(decodeURIComponent(seg))) return true;
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Aggregation pipeline (aggregate -> dedupe -> prefer)
+// ---------------------------------------------------------------------------
+
+async function getNodes(env, request) {
+  const { nodes, stats } = await aggregateNodes(env, request);
+  const deduped = dedupeNodes(nodes);
+  return { nodes: deduped, stats: { ...stats, total: deduped.length } };
+}
+
+function resolvePrefer(url, env) {
+  const ip =
+    url.searchParams.get('ip') ||
+    url.searchParams.get('preferIp') ||
+    splitCsv(env.PREFER_IP)[0] ||
+    '';
+  const domain =
+    url.searchParams.get('domain') ||
+    url.searchParams.get('preferDomain') ||
+    (env.PREFER_DOMAIN || '').trim();
+  return { ip: ip.trim(), domain };
+}
+
+// ---------------------------------------------------------------------------
+// Cache (Cache API, TTL = SUBUPTIME hours)
+// ---------------------------------------------------------------------------
+
+function cacheTtlSeconds(env) {
+  const h = parseInt(env.SUBUPTIME, 10);
+  const hours = Number.isFinite(h) && h > 0 ? h : DEFAULT_UPTIME_HOURS;
+  return hours * 3600;
+}
+
+/** Cache key: normalized subscription request (token & nocache stripped). */
+function cacheRequestFor(request, target, preferIp, preferDomain) {
+  const u = new URL(request.url);
+  u.pathname = '/sub';
+  u.searchParams.delete('token');
+  u.searchParams.delete('nocache');
+  u.searchParams.delete('preferIp');
+  u.searchParams.delete('preferDomain');
+  u.searchParams.set('target', target);
+  if (preferIp) u.searchParams.set('ip', preferIp);
+  else u.searchParams.delete('ip');
+  if (preferDomain) u.searchParams.set('domain', preferDomain);
+  else u.searchParams.delete('domain');
+  return new Request(u.toString(), { method: 'GET' });
+}
+
+// ---------------------------------------------------------------------------
+// HTML pages
+// ---------------------------------------------------------------------------
+
+function landingPageHtml(env) {
+  const name = escapeHtml(env.SUBNAME || DEFAULT_SUBNAME);
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${name}</title>
+<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:720px;margin:48px auto;padding:0 20px;line-height:1.6;color:#222}code{background:#f2f2f2;padding:2px 6px;border-radius:4px}h1{font-size:24px}</style>
+</head>
+<body>
+<h1>${name}</h1>
+<p>订阅聚合服务：将多个节点链接与订阅链接整合成一个统一订阅，并按客户端自动转换格式。</p>
+<h2>使用方法</h2>
+<p>在订阅地址后加上访问口令：</p>
+<p><code>/?token=YOUR_TOKEN</code> 或 <code>/sub?token=YOUR_TOKEN</code></p>
+<p>输出格式：<code>?target=base64</code>（默认）、<code>raw</code>、<code>clash</code>、<code>singbox</code>，其它格式（surge / quanx / loon / shadowrocket）需要配置 <code>SUBAPI</code> 转换后端。</p>
+<h2>edgeTunnel 优选</h2>
+<p>对部署在 Cloudflare 上的 edgeTunnel 节点，可用优选 IP / 域名替换连接地址：</p>
+<p><code>?ip=1.2.3.4</code> 或 <code>?domain=example.com</code>（两者都给时 IP 优先）。原始域名的 TLS SNI 与 Host 头会被保留。</p>
+<p>未配置访问口令时本服务公开访问；配置 <code>TOKEN</code> 后需要鉴权。</p>
+</body>
+</html>`;
+}
+
+function dashboardHtml(env, nodes, stats, url, tokens) {
+  const name = escapeHtml(env.SUBNAME || DEFAULT_SUBNAME);
+  const origin = url.origin;
+  const guest = tokens ? tokens.daily : '';
+  const mk = (target) =>
+    `${origin}/sub?token=${encodeURIComponent(guest)}&target=${target}`;
+  const targets = ['base64', 'raw', 'clash', 'singbox', 'surge', 'quanx', 'loon', 'shadowrocket'];
+  const rows = targets
+    .map((t) => `<li><a href="${escapeHtml(mk(t))}">${t}</a></li>`)
+    .join('\n');
+  const preferExample =
+    `${origin}/sub?token=${encodeURIComponent(guest)}&target=clash&ip=104.21.0.1&domain=example.com`;
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${name} — 订阅管理</title>
+<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:720px;margin:48px auto;padding:0 20px;line-height:1.6;color:#222}code{background:#f2f2f2;padding:2px 6px;border-radius:4px;word-break:break-all}h1{font-size:24px}li{margin:4px 0}</style>
+</head>
+<body>
+<h1>${name}</h1>
+<p>当前节点数：<strong>${nodes.length}</strong>（直连 ${stats.direct}，订阅成功 ${stats.subsOk}，订阅失败 ${stats.subsFailed}，解析失败 ${stats.parseFailed}）</p>
+<h2>订阅链接（访客 token，每日轮换）</h2>
+<ul>
+${rows}
+</ul>
+<h2>edgeTunnel 优选示例</h2>
+<p><code>${escapeHtml(preferExample)}</code></p>
+<p>说明：<code>ip</code> 替换连接地址，<code>domain</code> 替换为优选域名；两者都给时 IP 优先。原始域名的 TLS SNI 与 Host 头会被保留，替换过的节点名后会追加“(优选)”。也可用 <code>preferIp</code> / <code>preferDomain</code> 作为同义参数，或直接配置环境变量 <code>PREFER_IP</code> / <code>PREFER_DOMAIN</code>。</p>
+<h2>固定访客 token</h2>
+<p><code>${escapeHtml(tokens ? tokens.fixed : '')}</code></p>
+<p>缓存：${escapeHtml(String(parseInt(env.SUBUPTIME, 10) || DEFAULT_UPTIME_HOURS))} 小时；加 <code>?nocache=1</code> 可绕过缓存。</p>
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// Main entry
+// ---------------------------------------------------------------------------
+
+async function handleFetch(request, env, ctx) {
+  const url = new URL(request.url);
+  const userAgent = request.headers.get('User-Agent') || '';
+
+  // Health check (no auth).
+  if (url.pathname === '/health') {
+    return new Response(JSON.stringify({ status: 'ok' }), {
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+    });
+  }
+
+  // Auth: TOKEN empty => public; otherwise master / fixed guest / daily guest.
+  const master = (env.TOKEN || '').trim();
+  let tokens = null;
+  if (master) tokens = await buildTokens(master);
+  const authed = !master || isAuthorized(url, tokens);
+  if (!authed) {
+    return new Response(landingPageHtml(env), {
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  }
+
+  // Authenticated browser visit to `/` => dashboard with live node count.
+  const target = resolveTarget(url, userAgent);
+  const isBrowser = userAgent.toLowerCase().includes('mozilla');
+  if (url.pathname === '/' && !url.searchParams.has('target') && isBrowser) {
+    const { nodes, stats } = await getNodes(env, request);
+    return new Response(dashboardHtml(env, nodes, stats, url, tokens), {
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  }
+
+  // --- Subscription flow ---
+  const { ip: preferIp, domain: preferDomain } = resolvePrefer(url, env);
+  const noCache = url.searchParams.get('nocache') === '1';
+  const edgeHosts = splitCsv(env.EDGETUNNEL_HOSTS || '');
+  const ttl = cacheTtlSeconds(env);
+
+  const cache = caches.default;
+  const cacheReq = cacheRequestFor(request, target, preferIp, preferDomain);
+  if (!noCache) {
+    const hit = await cache.match(cacheReq);
+    if (hit) return hit;
+  }
+
+  const { nodes, stats } = await getNodes(env, request);
+  applyPrefer(nodes, preferIp, preferDomain, edgeHosts);
+
+  let body = '';
+  let contentType = 'text/plain; charset=utf-8';
+  let fallback = false;
+
+  if (target === 'clash') {
+    body = toClash(nodes);
+    contentType = 'text/yaml; charset=utf-8';
+  } else if (target === 'singbox') {
+    body = toSingbox(nodes);
+    contentType = 'application/json; charset=utf-8';
+  } else if (target === 'raw') {
+    body = toRaw(nodes);
+  } else if (target === 'base64') {
+    body = toBase64(nodes);
+  } else {
+    // surge / quanx / loon / shadowrocket / ... via external converter.
+    const selfUrl = new URL(request.url);
+    selfUrl.pathname = '/sub';
+    selfUrl.searchParams.set('target', 'base64');
+    selfUrl.searchParams.delete('nocache');
+    selfUrl.searchParams.delete('ip');
+    selfUrl.searchParams.delete('domain');
+    selfUrl.searchParams.delete('preferIp');
+    selfUrl.searchParams.delete('preferDomain');
+    if (tokens) selfUrl.searchParams.set('token', tokens.daily);
+    const converted = await forwardToConverter(target, selfUrl.toString(), env, userAgent);
+    if (converted) {
+      body = converted.body;
+      contentType = converted.contentType;
+    } else {
+      body = toBase64(nodes);
+      fallback = true;
+    }
+  }
+
+  const headers = subHeaders(env, userAgent, {
+    'content-type': contentType,
+    'Cache-Control': `public, max-age=${ttl}`,
+  });
+  if (fallback) headers['X-Fallback'] = 'base64';
+  const response = new Response(body, { headers });
+
+  if (!noCache) {
+    // Store a clone; the original is returned to the client.
+    await cache.put(cacheReq, response.clone());
+  }
+  return response;
+}
