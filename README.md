@@ -7,6 +7,8 @@
 
 一个跑在 Cloudflare Workers 上的订阅聚合与转换服务：把多个节点链接和订阅链接整合成一个统一订阅，按客户端自动输出对应格式，并可针对部署在 Cloudflare 上的 edgeTunnel 服务做优选 IP / 优选域名替换。
 
+本项目由 **Muse 全权创建**（代码原创编写）。架构思路参考了上游开源项目 [cmliu/CF-Workers-SUB](https://github.com/cmliu/CF-Workers-SUB)（作者 cmliu，Apache-2.0 协议；该项目已归档停更，汇聚功能已并入 [edgetunnel](https://github.com/cmliu/edgetunnel)），感谢 cmliu 的开源工作。本项目未逐字复制上游代码。
+
 ### 功能
 
 - **聚合**：`LINK`（节点链接）+ `LINKSUB`（订阅 URL）合并为一个订阅；订阅 URL 并行拉取（8 秒超时，单个失败不影响整体）。
@@ -167,12 +169,19 @@ A: 这些格式需要 `SUBAPI` 转换后端。未配置 `SUBAPI` 时会自动回
 **Q: 节点名后面多了 `(优选)` / `(2)` 是什么？**
 A: `(优选)` 表示该节点被优选 IP/域名替换过；`(2)`、`(3)` 是同名节点自动加的去重后缀。
 
+### 致谢
+
+- 上游项目：[cmliu/CF-Workers-SUB](https://github.com/cmliu/CF-Workers-SUB)（作者 cmliu，Apache-2.0）——本项目参考了它的架构思路，感谢 cmliu 的开源工作。
+- 本项目由 Muse 全权创建，代码原创编写。
+
 ---
 
 <a id="english"></a>
 ## English
 
 A subscription aggregator & converter running on Cloudflare Workers: merge multiple node links and subscription URLs into one unified subscription, output in the format each client expects, and rewrite edgeTunnel (Cloudflare-hosted) nodes to a preferred IP / domain.
+
+This project was **created entirely by Muse** (the code is original work). Its architecture is inspired by the upstream open-source project [cmliu/CF-Workers-SUB](https://github.com/cmliu/CF-Workers-SUB) (by cmliu, Apache-2.0; that project is archived, and its aggregation features were merged into [edgetunnel](https://github.com/cmliu/edgetunnel)) — thanks to cmliu for the open-source work. No upstream code was copied verbatim.
 
 ### Features
 
@@ -333,6 +342,11 @@ A: Those formats need a `SUBAPI` converter backend. Without `SUBAPI` the service
 
 **Q: What do the `(优选)` / `(2)` suffixes in node names mean?**
 A: `(优选)` means the node was replaced with a preferred IP/domain; `(2)`, `(3)` are automatic suffixes for duplicate names.
+
+### Acknowledgments
+
+- Upstream project: [cmliu/CF-Workers-SUB](https://github.com/cmliu/CF-Workers-SUB) (by cmliu, Apache-2.0) — this project took architectural inspiration from it; thanks to cmliu for the open-source work.
+- This project was created entirely by Muse, and its code is original work.
 
 ## License
 
