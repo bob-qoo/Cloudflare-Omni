@@ -2,7 +2,16 @@ name = "cloudflare-omni"
 main = "src/index.js"
 compatibility_date = "2026-11-24"
 
-# No KV / R2 / Durable Objects are required.
+# KV is optional but recommended: it persists the admin-managed config and
+# the IP library (preferred-IP candidate pool). Without the binding the
+# Worker still works, but /admin and /api/* are unavailable and preferred
+# IPs only come from env vars / query params.
+# Create the namespace once, then replace the id below with the returned one:
+#   npx wrangler kv namespace create OMNI_KV
+[[kv_namespaces]]
+binding = "OMNI_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
 # Caching uses the built-in Cache API; secrets live in Dashboard vars.
 
 # ---------------------------------------------------------------------------

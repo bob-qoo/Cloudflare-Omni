@@ -8,8 +8,13 @@
  * address to a preferred IP / domain while keeping the original TLS SNI
  * and Host header intact.
  *
+ * An optional KV namespace (binding OMNI_KV) persists configuration and an
+ * IP library (preferred-IP candidate pool) that can be managed from the
+ * built-in admin page at /admin; without the binding the Worker still works
+ * with env vars + query params only.
+ *
  * No npm dependencies. Pure Worker runtime APIs only
- * (fetch, Cache, crypto.subtle, TextEncoder/TextDecoder, atob/btoa).
+ * (fetch, Cache, KV, crypto.subtle, TextEncoder/TextDecoder, atob/btoa).
  */
 
 export default { fetch: handleFetch };
@@ -2051,26 +2056,777 @@ function isAuthorized(url, tokens) {
 }
 
 // ---------------------------------------------------------------------------
+// KV storage (OMNI_KV): persistent config + IP library
+// ---------------------------------------------------------------------------
+// The binding is optional: when env.OMNI_KV is absent, every KV read
+// returns an empty value and every KV write is skipped (logged, never
+// fatal), so the Worker keeps working with env vars + query params only.
+//   KV key "config": JSON object, keys are the lowercase config fields.
+//   KV key "ips":    JSON array of {ip, region, label, latency, enabled,
+//                     updatedAt}.
+
+const KV_CONFIG_KEY = 'config';
+const KV_IPS_KEY = 'ips';
+const TOKEN_MASK = '********';
+
+/** KV key <-> env var name map for the config object. */
+const CONFIG_FIELDS = [
+  { kv: 'token', env: 'TOKEN' },
+  { kv: 'link', env: 'LINK' },
+  { kv: 'linksub', env: 'LINKSUB' },
+  { kv: 'subapi', env: 'SUBAPI' },
+  { kv: 'subname', env: 'SUBNAME' },
+  { kv: 'subuptime', env: 'SUBUPTIME' },
+  { kv: 'preferIp', env: 'PREFER_IP' },
+  { kv: 'preferDomain', env: 'PREFER_DOMAIN' },
+  { kv: 'edgetunnelHosts', env: 'EDGETUNNEL_HOSTS' },
+];
+
+/** Safe KV read: null when unbound, missing, or on error (never throws). */
+async function kvGet(env, key) {
+  const kv = env?.OMNI_KV;
+  if (!kv) return null;
+  try {
+    return await kv.get(key, 'text');
+  } catch (e) {
+    console.error(`[omni] KV get ${key} failed:`, e);
+    return null;
+  }
+}
+
+/** Safe KV write: false when unbound or on error (never throws). */
+async function kvPut(env, key, value) {
+  const kv = env?.OMNI_KV;
+  if (!kv) return false;
+  try {
+    await kv.put(key, value);
+    return true;
+  } catch (e) {
+    console.error(`[omni] KV put ${key} failed:`, e);
+    return false;
+  }
+}
+
+/** Load the KV config object ({} when unbound / missing / invalid). */
+async function loadKvConfig(env) {
+  const raw = await kvGet(env, KV_CONFIG_KEY);
+  if (!raw) return {};
+  try {
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+  } catch {
+    console.error('[omni] KV config is not valid JSON, ignoring it');
+    return {};
+  }
+}
+
+/** Load the KV IP library array ([] when unbound / missing / invalid). */
+async function loadKvIps(env) {
+  const raw = await kvGet(env, KV_IPS_KEY);
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    console.error('[omni] KV ips is not valid JSON, ignoring it');
+    return [];
+  }
+}
+
+/** Persist the KV config object. False when KV is unbound / fails. */
+async function saveKvConfig(env, obj) {
+  return kvPut(env, KV_CONFIG_KEY, JSON.stringify(obj));
+}
+
+/** Persist the KV IP library array. False when KV is unbound / fails. */
+async function saveKvIps(env, list) {
+  return kvPut(env, KV_IPS_KEY, JSON.stringify(list));
+}
+
+/**
+ * Normalize one config value to a string (KV may store numbers / arrays).
+ * Arrays join with '\n' for link/linksub and ',' for everything else.
+ */
+function normalizeConfigValue(kvKey, kvVal, envVal) {
+  let v = kvVal;
+  if (v === undefined || v === null || v === '') v = envVal;
+  if (v === undefined || v === null) v = '';
+  if (Array.isArray(v)) {
+    v = (kvKey === 'link' || kvKey === 'linksub') ? v.join('\n') : v.join(',');
+  }
+  return String(v);
+}
+
+/**
+ * Effective config: KV config wins over env vars, env wins over defaults.
+ * Returns a plain object keyed by the env-var names (TOKEN, LINK, ...),
+ * so the existing pipeline can use it wherever it used `env`.
+ */
+async function resolveEffectiveConfig(env) {
+  const kvCfg = await loadKvConfig(env);
+  const cfg = {};
+  for (const { kv, env: envKey } of CONFIG_FIELDS) {
+    cfg[envKey] = normalizeConfigValue(kv, kvCfg[kv], env[envKey]);
+  }
+  return cfg;
+}
+
+/** Mask a token for API responses (never echo the real value). */
+function maskToken(token) {
+  return token ? TOKEN_MASK : '';
+}
+
+/** Effective config in KV field names, token masked (for GET /api/config). */
+function effectiveConfigForApi(cfg) {
+  const out = {};
+  for (const { kv, env: envKey } of CONFIG_FIELDS) {
+    out[kv] = cfg[envKey] ?? '';
+  }
+  out.token = maskToken(out.token);
+  out.subname = out.subname || DEFAULT_SUBNAME;
+  const n = parseInt(out.subuptime, 10);
+  out.subuptime = Number.isFinite(n) ? n : DEFAULT_UPTIME_HOURS;
+  return out;
+}
+
+// --- IP library ------------------------------------------------------------
+
+function isValidIpv4(ip) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (!m) return false;
+  return m.slice(1).every((oct) => Number(oct) >= 0 && Number(oct) <= 255);
+}
+
+function isValidIpv6(ip) {
+  if (!ip || typeof ip !== 'string' || ip.includes(' ')) return false;
+  let s = ip;
+  // IPv4-mapped tail (::ffff:1.2.3.4): validate the v4 part, then treat it
+  // as two groups for the group-count check.
+  if (s.includes('.')) {
+    const lastColon = s.lastIndexOf(':');
+    if (lastColon < 0) return false;
+    if (!isValidIpv4(s.slice(lastColon + 1))) return false;
+    s = s.slice(0, lastColon + 1) + '0:0';
+  }
+  if (s.includes('::')) {
+    if (s.indexOf('::') !== s.lastIndexOf('::')) return false;
+    const [left, right] = s.split('::');
+    const lg = left ? left.split(':') : [];
+    const rg = right ? right.split(':') : [];
+    if (lg.length + rg.length > 7) return false;
+    return [...lg, ...rg].every((g) => /^[0-9a-fA-F]{1,4}$/.test(g));
+  }
+  const groups = s.split(':');
+  if (groups.length !== 8) return false;
+  return groups.every((g) => /^[0-9a-fA-F]{1,4}$/.test(g));
+}
+
+function isValidIp(ip) {
+  return isValidIpv4(ip) || isValidIpv6(ip);
+}
+
+/**
+ * Normalize one IP entry. `base` is the existing entry when updating
+ * (fields not present in `raw` are preserved). Returns null when invalid.
+ */
+function normalizeIpEntry(raw, base) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const merged = { ...(base || {}), ...raw };
+  const ip = String(merged.ip || '').trim();
+  if (!isValidIp(ip)) return null;
+  const entry = {
+    ip,
+    region: String(merged.region || '').trim(),
+    label: String(merged.label || '').trim(),
+    latency: null,
+    enabled: true,
+    updatedAt: new Date().toISOString(),
+  };
+  if (merged.latency !== undefined && merged.latency !== null && merged.latency !== '') {
+    const n = Number(merged.latency);
+    if (Number.isFinite(n) && n >= 0) entry.latency = n;
+  }
+  if (typeof merged.enabled === 'boolean') entry.enabled = merged.enabled;
+  else if (merged.enabled === 0 || merged.enabled === '0' || merged.enabled === 'false') entry.enabled = false;
+  else if (merged.enabled === 1 || merged.enabled === '1' || merged.enabled === 'true') entry.enabled = true;
+  if (merged.updatedAt && !isNaN(Date.parse(merged.updatedAt))) {
+    entry.updatedAt = new Date(merged.updatedAt).toISOString();
+  }
+  return entry;
+}
+
+/** Dedupe an IP list by address (case-insensitive), first occurrence wins. */
+function dedupeIpList(list) {
+  const seen = new Set();
+  const out = [];
+  for (const e of list) {
+    if (!e || !e.ip) continue;
+    const key = String(e.ip).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(e);
+  }
+  return out;
+}
+
+/**
+ * Pick the best IP from the pool: only enabled entries; prefer the given
+ * region (falls back to any region when it has no entries); lowest latency
+ * first, entries without latency last (stable order). Returns '' when empty.
+ */
+function pickPreferredIp(pool, region) {
+  if (!Array.isArray(pool) || pool.length === 0) return '';
+  const enabled = pool.filter((e) => e && e.ip && e.enabled !== false);
+  if (enabled.length === 0) return '';
+  const want = String(region || '').trim().toLowerCase();
+  let candidates = enabled;
+  if (want) {
+    const inRegion = enabled.filter((e) => String(e.region || '').toLowerCase() === want);
+    if (inRegion.length > 0) candidates = inRegion;
+  }
+  const sorted = [...candidates].sort((a, b) => {
+    const la = typeof a.latency === 'number' ? a.latency : Infinity;
+    const lb = typeof b.latency === 'number' ? b.latency : Infinity;
+    return la - lb;
+  });
+  return sorted[0].ip || '';
+}
+
+/**
+ * Parse bulk-import text: one IP per line, `ip`, `ip#region` or
+ * `ip#region#label`. Lines starting with '#' are comments.
+ */
+function parseIpImportText(text) {
+  const entries = [];
+  for (const line of splitLines(text)) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const parts = t.split('#');
+    entries.push({
+      ip: (parts[0] || '').trim(),
+      region: (parts[1] || '').trim(),
+      label: parts.slice(2).join('#').trim(),
+    });
+  }
+  return entries;
+}
+
+// --- Config patch validation -----------------------------------------------
+
+const CONFIG_FIELD_TYPES = {
+  token: 'string', link: 'string', linksub: 'string', subapi: 'string',
+  subname: 'string', subuptime: 'int', preferIp: 'string',
+  preferDomain: 'string', edgetunnelHosts: 'string',
+};
+
+function validateConfigPatch(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: '请求体必须是 JSON 对象。' };
+  }
+  const patch = {};
+  for (const [k, v] of Object.entries(body)) {
+    const type = CONFIG_FIELD_TYPES[k];
+    if (!type) {
+      return { ok: false, error: `未知配置字段: ${k}。允许的字段: ${Object.keys(CONFIG_FIELD_TYPES).join(', ')}。` };
+    }
+    if (type === 'int') {
+      const n = typeof v === 'number' ? v : (typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN);
+      if (!Number.isInteger(n) || n < 1 || n > 168) {
+        return { ok: false, error: 'subuptime 必须是 1-168 的整数。' };
+      }
+      patch[k] = n;
+    } else if (typeof v === 'string') {
+      patch[k] = v;
+    } else if (Array.isArray(v) && v.every((x) => typeof x === 'string')) {
+      patch[k] = (k === 'link' || k === 'linksub') ? v.join('\n') : v.join(',');
+    } else {
+      return { ok: false, error: `字段 ${k} 必须是字符串或字符串数组。` };
+    }
+  }
+  return { ok: true, patch };
+}
+
+// --- Admin auth & handlers -------------------------------------------------
+
+function jsonResponse(obj, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', ...extraHeaders },
+  });
+}
+
+/** Master token from the request: ?token= query param or Bearer header. */
+function adminTokenFromRequest(request) {
+  const url = new URL(request.url);
+  const q = url.searchParams.get('token');
+  if (q) return q;
+  const auth = request.headers.get('Authorization') || '';
+  const m = /^Bearer\s+(.+)$/i.exec(auth.trim());
+  return m ? m[1] : '';
+}
+
+/** 503 when the KV binding is missing (write endpoints need KV). */
+function requireKvResponse(env) {
+  if (env?.OMNI_KV) return null;
+  return jsonResponse(
+    { ok: false, error: 'KV_NOT_CONFIGURED', message: '未绑定 KV（OMNI_KV）。请先在 wrangler.toml 里配置 kv_namespaces 并部署，或在 Dashboard 绑定 KV 命名空间。' },
+    503,
+  );
+}
+
+function adminForbiddenHtml(message) {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloudflare-Omni 管理</title>
+<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:560px;margin:48px auto;padding:0 20px;line-height:1.6;color:#222}input{padding:8px;width:280px}button{padding:8px 14px;cursor:pointer}</style>
+</head>
+<body>
+<h1>Cloudflare-Omni 管理</h1>
+<p>${escapeHtml(message)}</p>
+<p>在下方输入主口令 TOKEN 后打开管理页：</p>
+<p><input id="t" type="password" placeholder="主口令 TOKEN"> <button onclick="location.href='/admin?token='+encodeURIComponent(document.getElementById('t').value)">打开管理页</button></p>
+<p>管理接口仅接受主口令，访客 token 不可用。</p>
+</body>
+</html>`;
+}
+
+function adminPageHtml() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloudflare-Omni 管理</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:860px;margin:32px auto;padding:0 20px;line-height:1.6;color:#222}
+h1{font-size:22px}h2{font-size:18px;margin-top:32px;border-bottom:1px solid #ddd;padding-bottom:4px}
+label{display:block;margin:8px 0;font-size:14px}
+input[type=text],input[type=password],input[type=number],textarea{width:100%;padding:7px;border:1px solid #ccc;border-radius:4px;box-sizing:border-box;font-size:14px}
+textarea{font-family:ui-monospace,Menlo,monospace}
+button{padding:7px 14px;margin:6px 6px 6px 0;cursor:pointer;border:1px solid #999;background:#fff;border-radius:4px}
+button.primary{background:#222;color:#fff;border-color:#222}
+table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}
+th,td{border:1px solid #ddd;padding:6px 8px;text-align:left}
+th{background:#f5f5f5}
+td input{width:100%;padding:4px;box-sizing:border-box}
+#msg{padding:10px;border-radius:4px;margin:12px 0;display:none}
+#msg.ok{display:block;background:#e6f4ea;color:#137333}
+#msg.err{display:block;background:#fce8e6;color:#a50e0e}
+.hint{color:#666;font-size:13px}
+.row{display:flex;gap:12px}.row>div{flex:1}
+</style>
+</head>
+<body>
+<h1>Cloudflare-Omni 管理</h1>
+<div id="msg"></div>
+
+<h2>访问口令</h2>
+<label>主口令 TOKEN <input id="token" type="password" placeholder="主口令（仅用于调用管理接口，不会保存到页面外）"></label>
+<button id="loadBtn">加载配置与 IP 库</button>
+<span class="hint">地址栏带 ?token= 时自动填入。</span>
+
+<h2>配置</h2>
+<p class="hint">保存后写入 KV，优先级：请求参数 &gt; KV 配置 &gt; 环境变量。留空表示沿用环境变量。token 字段显示为掩码，留空表示不修改。</p>
+<form id="cfgForm">
+<label>主口令 token <input id="c_token" type="password" placeholder="********（留空不修改）" autocomplete="off"></label>
+<label>节点与订阅链接 link（每行一个）<textarea id="c_link" rows="4"></textarea></label>
+<label>额外订阅链接 linksub（每行一个）<textarea id="c_linksub" rows="2"></textarea></label>
+<div class="row">
+<div><label>转换后端 subapi <input id="c_subapi" type="text"></label></div>
+<div><label>订阅名 subname <input id="c_subname" type="text"></label></div>
+<div><label>缓存小时 subuptime（1-168） <input id="c_subuptime" type="number" min="1" max="168"></label></div>
+</div>
+<div class="row">
+<div><label>优选 IP preferIp <input id="c_preferIp" type="text" placeholder="1.2.3.4，多个用逗号分隔"></label></div>
+<div><label>优选域名 preferDomain <input id="c_preferDomain" type="text"></label></div>
+</div>
+<label>edgeTunnel 域名 edgetunnelHosts（逗号分隔）<input id="c_edgetunnelHosts" type="text"></label>
+<button class="primary" type="submit">保存配置</button>
+</form>
+
+<h2>IP 库（edgeTunnel 优选候选池）</h2>
+<p class="hint">未给 ?ip= 且未配 PREFER_IP 时，edgeTunnel 节点自动从这里挑选：优先 ?region= 指定的地区、仅 enabled、延迟最小者优先。</p>
+<table id="ipTable">
+<thead><tr><th>IP</th><th>地区</th><th>备注</th><th>延迟(ms)</th><th>启用</th><th>操作</th></tr></thead>
+<tbody id="ipBody"></tbody>
+</table>
+<h3>新增 / 编辑</h3>
+<form id="ipForm">
+<div class="row">
+<div><label>IP <input id="f_ip" type="text" required placeholder="1.2.3.4 或 IPv6"></label></div>
+<div><label>地区 region <input id="f_region" type="text" placeholder="HK / US / JP"></label></div>
+<div><label>备注 label <input id="f_label" type="text"></label></div>
+<div><label>延迟 latency(ms) <input id="f_latency" type="number" min="0"></label></div>
+<div><label>启用 enabled <input id="f_enabled" type="checkbox" checked></label></div>
+</div>
+<button class="primary" type="submit">保存该条</button>
+<button type="button" id="ipClear">清空表单</button>
+</form>
+<h3>批量导入</h3>
+<textarea id="importText" rows="6" placeholder="每行一个 IP，格式：ip 或 ip#region 或 ip#region#label"></textarea><br>
+<button id="importBtn">导入</button>
+<button id="exportBtn">导出 JSON</button>
+
+<script>
+var tokenInput = document.getElementById('token');
+var msgBox = document.getElementById('msg');
+var qs = new URLSearchParams(location.search);
+if (qs.get('token')) tokenInput.value = qs.get('token');
+
+function showMsg(text, ok) {
+  msgBox.textContent = text;
+  msgBox.className = ok ? 'ok' : 'err';
+}
+function token() { return tokenInput.value.trim(); }
+function api(path, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  var sep = path.indexOf('?') >= 0 ? '&' : '?';
+  return fetch(path + sep + 'token=' + encodeURIComponent(token()), opts);
+}
+function loadAll() {
+  if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
+  api('/api/config').then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { showMsg('加载配置失败：' + (d.message || d.error), false); return; }
+    var c = d.config || {};
+    document.getElementById('c_token').value = '';
+    document.getElementById('c_link').value = c.link || '';
+    document.getElementById('c_linksub').value = c.linksub || '';
+    document.getElementById('c_subapi').value = c.subapi || '';
+    document.getElementById('c_subname').value = c.subname || '';
+    document.getElementById('c_subuptime').value = (c.subuptime === undefined || c.subuptime === null) ? '' : c.subuptime;
+    document.getElementById('c_preferIp').value = c.preferIp || '';
+    document.getElementById('c_preferDomain').value = c.preferDomain || '';
+    document.getElementById('c_edgetunnelHosts').value = c.edgetunnelHosts || '';
+    showMsg('配置已加载。', true);
+  }).catch(function (e) { showMsg('加载配置失败：' + e.message, false); });
+  loadIps();
+}
+function loadIps() {
+  api('/api/ips').then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { showMsg('加载 IP 库失败：' + (d.message || d.error), false); return; }
+    renderIps(d.ips || []);
+  }).catch(function (e) { showMsg('加载 IP 库失败：' + e.message, false); });
+}
+function renderIps(list) {
+  var body = document.getElementById('ipBody');
+  body.innerHTML = '';
+  list.forEach(function (e) {
+    var tr = document.createElement('tr');
+    var tdIp = document.createElement('td'); tdIp.textContent = e.ip; tr.appendChild(tdIp);
+    var tdR = document.createElement('td'); tdR.textContent = e.region || ''; tr.appendChild(tdR);
+    var tdL = document.createElement('td'); tdL.textContent = e.label || ''; tr.appendChild(tdL);
+    var tdLat = document.createElement('td'); tdLat.textContent = (e.latency === null || e.latency === undefined) ? '' : e.latency; tr.appendChild(tdLat);
+    var tdE = document.createElement('td'); tdE.textContent = e.enabled === false ? '否' : '是'; tr.appendChild(tdE);
+    var tdA = document.createElement('td');
+    var bEdit = document.createElement('button'); bEdit.textContent = '编辑';
+    bEdit.onclick = function () {
+      document.getElementById('f_ip').value = e.ip;
+      document.getElementById('f_region').value = e.region || '';
+      document.getElementById('f_label').value = e.label || '';
+      document.getElementById('f_latency').value = (e.latency === null || e.latency === undefined) ? '' : e.latency;
+      document.getElementById('f_enabled').checked = e.enabled !== false;
+      window.scrollTo(0, document.getElementById('ipForm').offsetTop);
+    };
+    var bDel = document.createElement('button'); bDel.textContent = '删除';
+    bDel.onclick = function () {
+      if (!confirm('删除 ' + e.ip + '？')) return;
+      api('/api/ips?ip=' + encodeURIComponent(e.ip), { method: 'DELETE' }).then(function (r) { return r.json(); }).then(function (d) {
+        if (!d.ok) { showMsg('删除失败：' + (d.message || d.error), false); return; }
+        showMsg('已删除 ' + e.ip + '。', true); loadIps();
+      }).catch(function (err) { showMsg('删除失败：' + err.message, false); });
+    };
+    tdA.appendChild(bEdit); tdA.appendChild(bDel); tr.appendChild(tdA);
+    body.appendChild(tr);
+  });
+  if (list.length === 0) {
+    var tr0 = document.createElement('tr');
+    var td0 = document.createElement('td'); td0.colSpan = 6; td0.textContent = 'IP 库为空。'; tr0.appendChild(td0);
+    body.appendChild(tr0);
+  }
+}
+document.getElementById('loadBtn').onclick = loadAll;
+document.getElementById('cfgForm').onsubmit = function (ev) {
+  ev.preventDefault();
+  if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
+  var body = {};
+  var t = document.getElementById('c_token').value;
+  if (t) body.token = t;
+  body.link = document.getElementById('c_link').value;
+  body.linksub = document.getElementById('c_linksub').value;
+  body.subapi = document.getElementById('c_subapi').value;
+  body.subname = document.getElementById('c_subname').value;
+  var up = document.getElementById('c_subuptime').value;
+  if (up !== '') body.subuptime = parseInt(up, 10);
+  body.preferIp = document.getElementById('c_preferIp').value;
+  body.preferDomain = document.getElementById('c_preferDomain').value;
+  body.edgetunnelHosts = document.getElementById('c_edgetunnelHosts').value;
+  api('/api/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { showMsg('保存失败：' + (d.message || d.error), false); return; }
+    showMsg('配置已保存。', true);
+  }).catch(function (e) { showMsg('保存失败：' + e.message, false); });
+};
+document.getElementById('ipForm').onsubmit = function (ev) {
+  ev.preventDefault();
+  if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
+  var lat = document.getElementById('f_latency').value;
+  var body = {
+    ip: document.getElementById('f_ip').value.trim(),
+    region: document.getElementById('f_region').value.trim(),
+    label: document.getElementById('f_label').value.trim(),
+    latency: lat === '' ? null : parseInt(lat, 10),
+    enabled: document.getElementById('f_enabled').checked,
+  };
+  api('/api/ips', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { showMsg('保存失败：' + (d.message || d.error), false); return; }
+    showMsg('已保存 ' + body.ip + '。', true); loadIps();
+  }).catch(function (e) { showMsg('保存失败：' + e.message, false); });
+};
+document.getElementById('ipClear').onclick = function () {
+  document.getElementById('f_ip').value = '';
+  document.getElementById('f_region').value = '';
+  document.getElementById('f_label').value = '';
+  document.getElementById('f_latency').value = '';
+  document.getElementById('f_enabled').checked = true;
+};
+document.getElementById('importBtn').onclick = function () {
+  if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
+  var text = document.getElementById('importText').value;
+  api('/api/ips/import', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: text }).then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { showMsg('导入失败：' + (d.message || d.error), false); return; }
+    showMsg('导入完成：新增 ' + d.added + ' 条，跳过 ' + d.skipped + ' 条。', true); loadIps();
+  }).catch(function (e) { showMsg('导入失败：' + e.message, false); });
+};
+document.getElementById('exportBtn').onclick = function () {
+  if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
+  api('/api/ips').then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { showMsg('导出失败：' + (d.message || d.error), false); return; }
+    var blob = new Blob([JSON.stringify(d.ips || [], null, 2)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'omni-ips.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }).catch(function (e) { showMsg('导出失败：' + e.message, false); });
+};
+if (tokenInput.value) loadAll();
+</script>
+</body>
+</html>`;
+}
+
+/**
+ * Admin dispatcher: /admin page + /api/* endpoints.
+ * All of them require the master token (env TOKEN or KV config token).
+ * Guest tokens (fixed / daily) are NOT accepted here. When no master
+ * token is configured at all, management is unavailable (403).
+ */
+async function handleAdmin(request, env, cfg) {
+  const url = new URL(request.url);
+  const isApi = url.pathname.startsWith('/api/');
+  const master = (cfg.TOKEN || '').trim();
+  const deny = (status, error, message) => {
+    if (isApi) return jsonResponse({ ok: false, error, message }, status);
+    return new Response(adminForbiddenHtml(message), {
+      status,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  };
+  if (!master) {
+    return deny(403, 'TOKEN_NOT_CONFIGURED', '请先设置 TOKEN（环境变量 TOKEN，或在 KV 配置里设置 token），再使用管理功能。');
+  }
+  const provided = adminTokenFromRequest(request);
+  if (!provided || provided !== master) {
+    return deny(403, 'FORBIDDEN', '管理接口需要主口令 TOKEN（?token= 或 Authorization: Bearer）。访客 token 不可用。');
+  }
+
+  if (url.pathname === '/admin') {
+    return new Response(adminPageHtml(), {
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  }
+  if (url.pathname === '/api/config' && request.method === 'GET') {
+    return jsonResponse({ ok: true, config: effectiveConfigForApi(cfg), kvBound: !!env?.OMNI_KV });
+  }
+  if (url.pathname === '/api/config' && request.method === 'POST') {
+    return await handleApiConfigPost(request, env);
+  }
+  if (url.pathname === '/api/ips' && request.method === 'GET') {
+    return await handleApiIpsGet(request, env);
+  }
+  if (url.pathname === '/api/ips' && request.method === 'POST') {
+    return await handleApiIpsPost(request, env);
+  }
+  if (url.pathname === '/api/ips' && request.method === 'PUT') {
+    return await handleApiIpsPut(request, env);
+  }
+  if (url.pathname === '/api/ips' && request.method === 'DELETE') {
+    return await handleApiIpsDelete(request, env);
+  }
+  if (url.pathname === '/api/ips/import' && request.method === 'POST') {
+    return await handleApiIpsImport(request, env);
+  }
+  return jsonResponse({ ok: false, error: 'NOT_FOUND', message: '未知的管理接口。' }, 404);
+}
+
+async function readJsonBody(request) {
+  try {
+    const text = await request.text();
+    if (!text || !text.trim()) return { ok: false, error: '请求体为空。' };
+    return { ok: true, body: JSON.parse(text) };
+  } catch {
+    return { ok: false, error: '请求体不是合法 JSON。' };
+  }
+}
+
+async function handleApiConfigPost(request, env) {
+  const noKv = requireKvResponse(env);
+  if (noKv) return noKv;
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) return jsonResponse({ ok: false, error: 'BAD_JSON', message: parsed.error }, 400);
+  const v = validateConfigPatch(parsed.body);
+  if (!v.ok) return jsonResponse({ ok: false, error: 'VALIDATION_FAILED', message: v.error }, 400);
+  const current = await loadKvConfig(env);
+  const next = { ...current, ...v.patch };
+  const saved = await saveKvConfig(env, next);
+  if (!saved) return jsonResponse({ ok: false, error: 'KV_WRITE_FAILED', message: '写入 KV 失败，请稍后重试。' }, 500);
+  const cfg = await resolveEffectiveConfig(env);
+  return jsonResponse({ ok: true, config: effectiveConfigForApi(cfg), kvBound: true });
+}
+
+async function handleApiIpsGet(request, env) {
+  const pool = await loadKvIps(env);
+  const url = new URL(request.url);
+  const region = (url.searchParams.get('region') || '').trim().toLowerCase();
+  const enabledParam = url.searchParams.get('enabled');
+  let list = pool;
+  if (region) list = list.filter((e) => String(e.region || '').toLowerCase() === region);
+  if (enabledParam === '1') list = list.filter((e) => e.enabled !== false);
+  if (enabledParam === '0') list = list.filter((e) => e.enabled === false);
+  return jsonResponse({ ok: true, ips: list, total: list.length, kvBound: !!env?.OMNI_KV });
+}
+
+async function handleApiIpsPost(request, env) {
+  const noKv = requireKvResponse(env);
+  if (noKv) return noKv;
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) return jsonResponse({ ok: false, error: 'BAD_JSON', message: parsed.error }, 400);
+  if (!Array.isArray(parsed.body)) {
+    return jsonResponse({ ok: false, error: 'VALIDATION_FAILED', message: '请求体必须是 JSON 数组。' }, 400);
+  }
+  const entries = [];
+  for (const raw of parsed.body) {
+    const e = normalizeIpEntry(raw, null);
+    if (!e) {
+      return jsonResponse({ ok: false, error: 'VALIDATION_FAILED', message: `无效的 IP 条目: ${JSON.stringify(raw)}。每条须含合法的 ip 字段。` }, 400);
+    }
+    entries.push(e);
+  }
+  const list = dedupeIpList(entries);
+  const saved = await saveKvIps(env, list);
+  if (!saved) return jsonResponse({ ok: false, error: 'KV_WRITE_FAILED', message: '写入 KV 失败，请稍后重试。' }, 500);
+  return jsonResponse({ ok: true, ips: list, total: list.length });
+}
+
+async function handleApiIpsPut(request, env) {
+  const noKv = requireKvResponse(env);
+  if (noKv) return noKv;
+  const parsed = await readJsonBody(request);
+  if (!parsed.ok) return jsonResponse({ ok: false, error: 'BAD_JSON', message: parsed.error }, 400);
+  const pool = await loadKvIps(env);
+  const key = String(parsed.body?.ip || '').trim().toLowerCase();
+  const idx = pool.findIndex((e) => String(e.ip || '').toLowerCase() === key);
+  const entry = normalizeIpEntry(parsed.body, idx >= 0 ? pool[idx] : null);
+  if (!entry) {
+    return jsonResponse({ ok: false, error: 'VALIDATION_FAILED', message: '无效的 IP 条目：ip 必须是合法的 IPv4 或 IPv6 地址。' }, 400);
+  }
+  if (idx >= 0) pool[idx] = entry;
+  else pool.push(entry);
+  const saved = await saveKvIps(env, pool);
+  if (!saved) return jsonResponse({ ok: false, error: 'KV_WRITE_FAILED', message: '写入 KV 失败，请稍后重试。' }, 500);
+  return jsonResponse({ ok: true, entry, total: pool.length, updated: idx >= 0 });
+}
+
+async function handleApiIpsDelete(request, env) {
+  const noKv = requireKvResponse(env);
+  if (noKv) return noKv;
+  const url = new URL(request.url);
+  const ip = (url.searchParams.get('ip') || '').trim().toLowerCase();
+  if (!ip) {
+    return jsonResponse({ ok: false, error: 'VALIDATION_FAILED', message: '缺少 ?ip= 参数。' }, 400);
+  }
+  const pool = await loadKvIps(env);
+  const next = pool.filter((e) => String(e.ip || '').toLowerCase() !== ip);
+  if (next.length === pool.length) {
+    return jsonResponse({ ok: false, error: 'NOT_FOUND', message: `IP 库中没有 ${ip}。` }, 404);
+  }
+  const saved = await saveKvIps(env, next);
+  if (!saved) return jsonResponse({ ok: false, error: 'KV_WRITE_FAILED', message: '写入 KV 失败，请稍后重试。' }, 500);
+  return jsonResponse({ ok: true, deleted: ip, total: next.length });
+}
+
+async function handleApiIpsImport(request, env) {
+  const noKv = requireKvResponse(env);
+  if (noKv) return noKv;
+  const text = await request.text();
+  const parsed = parseIpImportText(text);
+  const pool = await loadKvIps(env);
+  const existing = new Set(pool.map((e) => String(e.ip || '').toLowerCase()));
+  let added = 0;
+  let skipped = 0;
+  let invalid = 0;
+  for (const raw of parsed) {
+    const entry = normalizeIpEntry(raw, null);
+    if (!entry) {
+      invalid++;
+      skipped++;
+      continue;
+    }
+    if (existing.has(entry.ip.toLowerCase())) {
+      skipped++;
+      continue;
+    }
+    existing.add(entry.ip.toLowerCase());
+    pool.push(entry);
+    added++;
+  }
+  const saved = await saveKvIps(env, pool);
+  if (!saved) return jsonResponse({ ok: false, error: 'KV_WRITE_FAILED', message: '写入 KV 失败，请稍后重试。' }, 500);
+  return jsonResponse({ ok: true, added, skipped, invalid, total: pool.length });
+}
+
+// ---------------------------------------------------------------------------
 // Aggregation pipeline (aggregate -> dedupe -> prefer)
 // ---------------------------------------------------------------------------
 
-async function getNodes(env, request) {
-  const { nodes, stats } = await aggregateNodes(env, request);
+async function getNodes(cfg, request) {
+  const { nodes, stats } = await aggregateNodes(cfg, request);
   const deduped = dedupeNodes(nodes);
   return { nodes: deduped, stats: { ...stats, total: deduped.length } };
 }
 
-function resolvePrefer(url, env) {
-  const ip =
-    url.searchParams.get('ip') ||
-    url.searchParams.get('preferIp') ||
-    splitCsv(env.PREFER_IP)[0] ||
-    '';
-  const domain =
+/**
+ * Resolve the preferred IP / domain for this request.
+ * Priority: query param > KV config > env var > default.
+ * `autoPick` is true when no explicit IP was given anywhere (or when the
+ * query explicitly asks for `?ip=auto`): the caller then picks one from
+ * the KV IP pool. `?ip=auto` ignores the PREFER_IP env var on purpose.
+ */
+function resolvePrefer(url, cfg) {
+  const qIp = (url.searchParams.get('ip') || url.searchParams.get('preferIp') || '').trim();
+  const domain = (
     url.searchParams.get('domain') ||
     url.searchParams.get('preferDomain') ||
-    (env.PREFER_DOMAIN || '').trim();
-  return { ip: ip.trim(), domain };
+    (cfg.PREFER_DOMAIN || '').trim()
+  );
+  if (qIp.toLowerCase() === 'auto') return { ip: '', domain, autoPick: true };
+  if (qIp) return { ip: qIp, domain, autoPick: false };
+  const envIp = splitCsv(cfg.PREFER_IP)[0] || '';
+  if (envIp) return { ip: envIp.trim(), domain, autoPick: false };
+  return { ip: '', domain, autoPick: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -2091,6 +2847,7 @@ function cacheRequestFor(request, target, preferIp, preferDomain) {
   u.searchParams.delete('nocache');
   u.searchParams.delete('preferIp');
   u.searchParams.delete('preferDomain');
+  u.searchParams.delete('region'); // region only affects the auto-pick, which the resolved ip already captures
   u.searchParams.set('target', target);
   if (preferIp) u.searchParams.set('ip', preferIp);
   else u.searchParams.delete('ip');
@@ -2122,7 +2879,9 @@ function landingPageHtml(env) {
 <p>输出格式：<code>?target=base64</code>（默认）、<code>raw</code>、<code>clash</code>、<code>singbox</code>，其它格式（surge / quanx / loon / shadowrocket）需要配置 <code>SUBAPI</code> 转换后端。</p>
 <h2>edgeTunnel 优选</h2>
 <p>对部署在 Cloudflare 上的 edgeTunnel 节点，可用优选 IP / 域名替换连接地址：</p>
-<p><code>?ip=1.2.3.4</code> 或 <code>?domain=example.com</code>（两者都给时 IP 优先）。原始域名的 TLS SNI 与 Host 头会被保留。</p>
+<p><code>?ip=1.2.3.4</code> 或 <code>?domain=example.com</code>（两者都给时 IP 优先）。原始域名的 TLS SNI 与 Host 头会被保留。未带 <code>ip</code> 时自动从 KV 的 IP 库中挑选（见管理页）。</p>
+<h2>管理</h2>
+<p>主口令持有者可打开 <code>/admin?token=YOUR_TOKEN</code> 管理配置与 IP 库（需要绑定 KV 命名空间 <code>OMNI_KV</code>）。</p>
 <p>未配置访问口令时本服务公开访问；配置 <code>TOKEN</code> 后需要鉴权。</p>
 </body>
 </html>`;
@@ -2173,20 +2932,31 @@ async function handleFetch(request, env, ctx) {
   const url = new URL(request.url);
   const userAgent = request.headers.get('User-Agent') || '';
 
-  // Health check (no auth).
+  // Health check (no auth, no KV).
   if (url.pathname === '/health') {
     return new Response(JSON.stringify({ status: 'ok' }), {
       headers: { 'content-type': 'application/json; charset=utf-8' },
     });
   }
 
+  // Effective config: KV config wins over env vars, env wins over defaults.
+  // The rest of this handler reads settings from `cfg` (same key names as
+  // env), while `env` is only used for the KV binding itself.
+  const cfg = await resolveEffectiveConfig(env);
+
+  // Admin UI + management APIs (master token only, see handleAdmin).
+  if (url.pathname === '/admin' || url.pathname.startsWith('/api/')) {
+    return await handleAdmin(request, env, cfg);
+  }
+
   // Auth: TOKEN empty => public; otherwise master / fixed guest / daily guest.
-  const master = (env.TOKEN || '').trim();
+  // The master token is the effective TOKEN (KV config token wins over env).
+  const master = (cfg.TOKEN || '').trim();
   let tokens = null;
   if (master) tokens = await buildTokens(master);
   const authed = !master || isAuthorized(url, tokens);
   if (!authed) {
-    return new Response(landingPageHtml(env), {
+    return new Response(landingPageHtml(cfg), {
       headers: { 'content-type': 'text/html; charset=utf-8' },
     });
   }
@@ -2195,17 +2965,25 @@ async function handleFetch(request, env, ctx) {
   const target = resolveTarget(url, userAgent);
   const isBrowser = userAgent.toLowerCase().includes('mozilla');
   if (url.pathname === '/' && !url.searchParams.has('target') && isBrowser) {
-    const { nodes, stats } = await getNodes(env, request);
-    return new Response(dashboardHtml(env, nodes, stats, url, tokens), {
+    const { nodes, stats } = await getNodes(cfg, request);
+    return new Response(dashboardHtml(cfg, nodes, stats, url, tokens), {
       headers: { 'content-type': 'text/html; charset=utf-8' },
     });
   }
 
   // --- Subscription flow ---
-  const { ip: preferIp, domain: preferDomain } = resolvePrefer(url, env);
+  const { ip: preferIp0, domain: preferDomain, autoPick } = resolvePrefer(url, cfg);
+  let preferIp = preferIp0;
+  if (autoPick) {
+    // No explicit IP anywhere: pick one from the KV IP pool (region-aware).
+    // Empty pool => no replacement, same behaviour as before KV existed.
+    const pool = await loadKvIps(env);
+    const picked = pickPreferredIp(pool, url.searchParams.get('region') || '');
+    if (picked) preferIp = picked;
+  }
   const noCache = url.searchParams.get('nocache') === '1';
-  const edgeHosts = splitCsv(env.EDGETUNNEL_HOSTS || '');
-  const ttl = cacheTtlSeconds(env);
+  const edgeHosts = splitCsv(cfg.EDGETUNNEL_HOSTS || '');
+  const ttl = cacheTtlSeconds(cfg);
 
   const cache = caches.default;
   const cacheReq = cacheRequestFor(request, target, preferIp, preferDomain);
@@ -2214,7 +2992,7 @@ async function handleFetch(request, env, ctx) {
     if (hit) return hit;
   }
 
-  const { nodes, stats } = await getNodes(env, request);
+  const { nodes, stats } = await getNodes(cfg, request);
   applyPrefer(nodes, preferIp, preferDomain, edgeHosts);
 
   let body = '';
@@ -2242,7 +3020,7 @@ async function handleFetch(request, env, ctx) {
     selfUrl.searchParams.delete('preferIp');
     selfUrl.searchParams.delete('preferDomain');
     if (tokens) selfUrl.searchParams.set('token', tokens.daily);
-    const converted = await forwardToConverter(target, selfUrl.toString(), env, userAgent);
+    const converted = await forwardToConverter(target, selfUrl.toString(), cfg, userAgent);
     if (converted) {
       body = converted.body;
       contentType = converted.contentType;
@@ -2252,7 +3030,7 @@ async function handleFetch(request, env, ctx) {
     }
   }
 
-  const headers = subHeaders(env, userAgent, {
+  const headers = subHeaders(cfg, userAgent, {
     'content-type': contentType,
     'Cache-Control': `public, max-age=${ttl}`,
   });

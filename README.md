@@ -63,6 +63,8 @@ GitHub Actions 自动部署：push 到 `main` 即触发 `.github/workflows/deplo
 | `token` | 访问口令（主口令 / 固定访客 token / 当日访客 token）。 |
 | `target` | 输出格式：`base64`（默认）、`raw`、`clash`、`singbox`、`surge`、`quanx`、`loon`、`shadowrocket`。优先于 User-Agent 自动识别。 |
 | `ip` / `preferIp` | 优选 IP，替换 edgeTunnel 节点的连接地址。 |
+| `ip=auto` | 从 KV 的 IP 库自动挑选优选 IP（忽略 `PREFER_IP` 环境变量）。 |
+| `region` | 配合自动挑选，优先指定地区的 IP（如 `HK`）。 |
 | `domain` / `preferDomain` | 优选域名，替换 edgeTunnel 节点的连接地址。`ip` 与 `domain` 都给时 IP 优先。 |
 | `nocache` | `=1` 时绕过缓存，强制重新聚合。 |
 
@@ -83,6 +85,51 @@ https://<worker域名>/sub?token=<TOKEN>&target=clash&domain=cf.example.com
 ```
 
 或直接在环境变量里配置 `PREFER_IP` / `PREFER_DOMAIN`，则所有请求默认生效。也可以在 `EDGETUNNEL_HOSTS` 里加自己的域名，例如 `EDGETUNNEL_HOSTS=edgetunnel.example.com,node.example.org`。
+
+### KV 存储、管理页与 IP 库
+
+用 Cloudflare KV（绑定名 `OMNI_KV`）持久化配置与 IP 库，改配置不用再重新部署。
+
+#### 创建与绑定
+
+```bash
+npx wrangler kv namespace create OMNI_KV
+```
+
+把返回的 `id` 填到 `wrangler.toml` 的 `kv_namespaces` 里（替换 `REPLACE_WITH_KV_NAMESPACE_ID`），再部署。也可以在 Dashboard → Workers → 你的 Worker → Settings → Variables → KV Namespace Bindings 里绑定，变量名填 `OMNI_KV`。
+
+不绑定 KV 也可以用：Worker 仍可正常工作，只是配置与 IP 库功能不可用（管理接口写操作返回 503，优选只认环境变量与查询参数）。
+
+#### 管理页
+
+用主口令打开：
+
+```
+https://<worker域名>/admin?token=<TOKEN>
+```
+
+管理页上方是配置表单（各配置项 + 保存），下方是 IP 库管理（表格列出 ip / 地区 / 备注 / 延迟 / 启用，支持单条新增 / 编辑 / 删除、批量导入、导出 JSON）。
+
+配置优先级：请求参数 > KV 配置 > 环境变量 > 默认值。KV 里的 token 若存在则作为管理口令与订阅主口令（覆盖环境变量 TOKEN）。
+
+#### 管理 API（均需主口令，`?token=` 或 `Authorization: Bearer <token>`；访客 token 不可用；未配置任何 TOKEN 时返回 403）
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /admin` | 管理页 HTML。 |
+| `GET /api/config` | 返回生效配置（KV 与环境变量合并后，token 掩码为 `********`）。 |
+| `POST /api/config` | JSON 保存配置子集；`subuptime` 须为 1–168 的整数，其余为字符串或字符串数组。返回保存后的生效配置（token 掩码）。 |
+| `GET /api/ips` | 返回 IP 库数组；支持 `?region=` 与 `?enabled=1/0` 过滤。 |
+| `POST /api/ips` | JSON 数组，整体替换 IP 库（校验 IP 合法、去重、补 `updatedAt`）。 |
+| `PUT /api/ips` | JSON 对象，单条新增或更新（按 ip 匹配）。 |
+| `DELETE /api/ips?ip=1.2.3.4` | 删除指定 IP。 |
+| `POST /api/ips/import` | `text/plain`，每行一个 IP，格式 `ip`、`ip#region`、`ip#region#label`，批量追加（已存在则跳过），返回 `{added, skipped}`。 |
+
+#### IP 库格式与优选规则
+
+每条：`{ip, region, label, latency, enabled, updatedAt}`。`ip` 为 IPv4/IPv6，`region` 为地区/国家（如 HK/US/JP，可空），`label` 为备注（可空），`latency` 为毫秒数（可空），`enabled` 默认为 `true`，`updatedAt` 为 ISO 时间（保存时自动补）。
+
+自动挑选规则（edgeTunnel 节点，且请求未带 `?ip=` / `?preferIp=`、也未配 `PREFER_IP` 环境变量时）：从 IP 库中挑选，优先 `?region=` 指定的地区、仅 `enabled` 的条目、延迟最小者优先、否则取第一条；挑到则按现有优选逻辑替换并标注 `(优选)`。`?ip=auto` 可显式要求从 IP 库自动挑选（忽略 `PREFER_IP` 环境变量）。IP 库为空且无 `?ip=` 时行为与原来一致（不替换）。
 
 ### 常见问题
 
@@ -167,6 +214,8 @@ GitHub Actions auto-deploy: pushing to `main` triggers `.github/workflows/deploy
 | `token` | Access token (master / fixed guest / daily guest). |
 | `target` | Output format: `base64` (default), `raw`, `clash`, `singbox`, `surge`, `quanx`, `loon`, `shadowrocket`. Takes priority over User-Agent detection. |
 | `ip` / `preferIp` | Preferred IP, replaces the connect address of edgeTunnel nodes. |
+| `ip=auto` | Auto-pick a preferred IP from the KV IP library (ignores the `PREFER_IP` env var). |
+| `region` | With auto-pick, prefer IPs from this region (e.g. `HK`). |
 | `domain` / `preferDomain` | Preferred domain, replaces the connect address of edgeTunnel nodes. When both `ip` and `domain` are given, IP wins. |
 | `nocache` | `=1` bypasses the cache and forces re-aggregation. |
 
@@ -187,6 +236,51 @@ https://<worker-domain>/sub?token=<TOKEN>&target=clash&domain=cf.example.com
 ```
 
 You can also set `PREFER_IP` / `PREFER_DOMAIN` as environment variables to apply by default, and add your own domains to `EDGETUNNEL_HOSTS`, e.g. `EDGETUNNEL_HOSTS=edgetunnel.example.com,node.example.org`.
+
+### KV storage, admin page & IP library
+
+Cloudflare KV (binding `OMNI_KV`) persists configuration and the IP library, so settings can change without redeploying.
+
+#### Create and bind
+
+```bash
+npx wrangler kv namespace create OMNI_KV
+```
+
+Put the returned `id` into the `kv_namespaces` block in `wrangler.toml` (replacing `REPLACE_WITH_KV_NAMESPACE_ID`) and redeploy. Or bind it in Dashboard → Workers → your Worker → Settings → Variables → KV Namespace Bindings, with the variable name `OMNI_KV`.
+
+Without a KV binding the Worker still works, but config and IP-library features are unavailable (management write endpoints return 503; preferred IPs only come from env vars and query params).
+
+#### Admin page
+
+Open with the master token:
+
+```
+https://<worker-domain>/admin?token=<TOKEN>
+```
+
+The page has a configuration form on top (all settings + save) and IP-library management below (table of ip / region / label / latency / enabled, with per-row add / edit / delete, bulk import, and JSON export).
+
+Config priority: request parameter > KV config > environment variable > default. A token stored in KV becomes both the management password and the subscription master token (overriding the `TOKEN` env var).
+
+#### Management API (all require the master token via `?token=` or `Authorization: Bearer <token>`; guest tokens do not work; 403 when no TOKEN is configured at all)
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /admin` | Admin page HTML. |
+| `GET /api/config` | Effective config (KV merged over env vars), token masked as `********`. |
+| `POST /api/config` | JSON body, saves a subset of config fields; `subuptime` must be an integer 1–168, others are strings or string arrays. Returns the effective config after saving (token masked). |
+| `GET /api/ips` | IP library array; supports `?region=` and `?enabled=1/0` filters. |
+| `POST /api/ips` | JSON array, replaces the whole IP library (validates IPs, dedupes, fills `updatedAt`). |
+| `PUT /api/ips` | JSON object, adds or updates a single entry (matched by ip). |
+| `DELETE /api/ips?ip=1.2.3.4` | Deletes the given IP. |
+| `POST /api/ips/import` | `text/plain`, one IP per line, formats `ip`, `ip#region`, `ip#region#label`; appends in bulk (existing entries skipped), returns `{added, skipped}`. |
+
+#### IP library format and auto-pick rules
+
+Each entry: `{ip, region, label, latency, enabled, updatedAt}`. `ip` is an IPv4/IPv6 address, `region` a region/country (e.g. HK/US/JP, optional), `label` a note (optional), `latency` in milliseconds (optional), `enabled` defaults to `true`, `updatedAt` is an ISO timestamp (filled automatically on save).
+
+Auto-pick rules (edgeTunnel nodes, when the request carries no `?ip=` / `?preferIp=` and no `PREFER_IP` env var is set): pick from the IP library, preferring the `?region=` region, only `enabled` entries, lowest latency first, otherwise the first entry; a picked IP is applied with the existing preferred-IP logic and marked `(优选)`. `?ip=auto` explicitly requests an automatic pick from the library (ignoring the `PREFER_IP` env var). With an empty library and no `?ip=`, behaviour is unchanged (no replacement).
 
 ### FAQ
 
