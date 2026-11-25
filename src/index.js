@@ -2615,17 +2615,46 @@ async function detectIpLabels(ips, existing) {
  * Parse bulk-import text: one IP per line, `ip`, `ip#region` or
  * `ip#region#label`. Lines starting with '#' are comments.
  */
+/** Strip an optional :port suffix from an IP literal ("1.2.3.4:443" or
+ * "[2001:db8::1]:443"). A bare IPv6 without brackets is left untouched. */
+function stripIpPort(host) {
+  const h = String(host || '').trim();
+  const bracket = /^\[([^\]]+)\]:\d+$/.exec(h);
+  if (bracket) return bracket[1];
+  const v4port = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+$/.exec(h);
+  if (v4port) return v4port[1];
+  return h;
+}
+
 function parseIpImportText(text) {
   const entries = [];
   for (const line of splitLines(text)) {
     const t = line.trim();
     if (!t || t.startsWith('#')) continue;
     const parts = t.split('#');
-    entries.push({
-      ip: (parts[0] || '').trim(),
-      region: (parts[1] || '').trim(),
-      label: parts.slice(2).join('#').trim(),
-    });
+    // Tolerate a :port suffix (BestCF-style lists ship "1.2.3.4:443").
+    const ip = stripIpPort((parts[0] || '').trim());
+    const rest = parts.slice(1).join('#').trim();
+    let region = '';
+    let label = '';
+    let latency;
+    if (rest.includes('|')) {
+      // BestCF-style: "name | carrier | ip | 157.74ms | speed"
+      const segs = rest.split('|').map((s) => s.trim()).filter(Boolean);
+      label = segs[0] || '';
+      region = segs[1] || '';
+      const ms = segs.map((s) => /([\d.]+)\s*ms/i.exec(s)).find(Boolean);
+      if (ms) {
+        const n = Number(ms[1]);
+        if (Number.isFinite(n) && n >= 0) latency = n;
+      }
+    } else {
+      region = (parts[1] || '').trim();
+      label = parts.slice(2).join('#').trim();
+    }
+    const entry = { ip, region, label };
+    if (latency !== undefined) entry.latency = latency;
+    entries.push(entry);
   }
   return entries;
 }
@@ -2741,6 +2770,7 @@ function adminPageHtml() {
 </head>
 <body>
 <h1>Cloudflare-Omni 管理</h1>
+<div id="toast" role="status" aria-live="polite"></div>
 <div id="msg" role="status" aria-live="polite"></div>
 
 <h2>访问口令</h2>
@@ -2849,9 +2879,18 @@ var msgBox = document.getElementById('msg');
   if (qs.get('token')) tokenInput.value = qs.get('token');
 })();
 
+var toastTimer = null;
+function showToast(text) {
+  var el = document.getElementById('toast');
+  el.textContent = text;
+  el.style.display = 'block';
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { el.style.display = 'none'; }, 5000);
+}
 function showMsg(text, ok) {
   msgBox.textContent = text;
   msgBox.className = ok ? 'ok' : 'err';
+  if (ok) showToast(text);
 }
 function token() { return tokenInput.value.trim(); }
 
@@ -2988,10 +3027,12 @@ function loadIps() {
   }).catch(function (e) { showMsg('加载 IP 库失败：' + e.message, false); });
 }
 function loadOnlineIps() {
-  api('/api/ips/online').then(function (r) { return r.json(); }).then(function (d) {
-    if (!d.ok) { renderOnline([]); return; }
-    renderOnline(d.ips || []);
-  }).catch(function () { renderOnline([]); });
+  return api('/api/ips/online').then(function (r) { return r.json(); }).then(function (d) {
+    if (!d.ok) { renderOnline([]); return 0; }
+    var list = d.ips || [];
+    renderOnline(list);
+    return list.length;
+  }).catch(function () { renderOnline([]); return 0; });
 }
 function renderOnline(list) {
   var body = document.getElementById('onlineBody');
@@ -3082,8 +3123,10 @@ document.getElementById('detectAllBtn').onclick = function () {
 document.getElementById('loadBtn').onclick = loadAll;
 document.getElementById('onlineLoadBtn').onclick = function () {
   if (!token()) { showMsg('请先输入主口令 TOKEN。', false); return; }
-  loadOnlineIps();
-  showMsg('在线列表已刷新。', true);
+  loadOnlineIps().then(function (n) {
+    if (n > 0) showMsg('在线列表已刷新，共 ' + n + ' 条。', true);
+    else showMsg('在线列表为空，未拉取到 IP，请检查 IPLIST 地址与格式。', false);
+  });
 };
 document.getElementById('cfgForm').onsubmit = function (ev) {
   ev.preventDefault();
@@ -3450,8 +3493,13 @@ function cacheTtlSeconds(env) {
   return hours * 3600;
 }
 
-/** Cache key: normalized subscription request (token & nocache stripped). */
-function cacheRequestFor(request, target, preferIp, preferDomain) {
+/**
+ * Cache key: normalized subscription request (token & nocache stripped).
+ * `cfgHash` is a short hash of the config that affects the output, so
+ * saving new nodes/links busts the cache instead of serving the old
+ * subscription for up to SUBUPTIME hours.
+ */
+function cacheRequestFor(request, target, preferIp, preferDomain, cfgHash) {
   const u = new URL(request.url);
   u.pathname = '/sub';
   u.searchParams.delete('token');
@@ -3461,6 +3509,7 @@ function cacheRequestFor(request, target, preferIp, preferDomain) {
   u.searchParams.delete('region'); // region only affects the auto-pick, which the resolved ip already captures
   u.searchParams.set('target', target);
   u.searchParams.set('v', CACHE_VERSION);
+  if (cfgHash) u.searchParams.set('cfgv', cfgHash);
   if (preferIp) u.searchParams.set('ip', preferIp);
   else u.searchParams.delete('ip');
   if (preferDomain) u.searchParams.set('domain', preferDomain);
@@ -3541,6 +3590,7 @@ td input{width:100%;padding:4px}
 #msg{padding:10px;border-radius:4px;margin:12px 0;display:none}
 #msg.ok{display:block;background:var(--ok-bg);color:var(--ok-fg)}
 #msg.err{display:block;background:var(--err-bg);color:var(--err-fg)}
+#toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:1000;padding:10px 18px;border-radius:8px;background:var(--ok-bg);color:var(--ok-fg);box-shadow:0 4px 16px rgba(0,0,0,.25);display:none;max-width:calc(100vw - 32px);text-align:center}
 @container (width < 600px){
   table,thead,tbody,tr,th,td{display:block}
   thead{display:none}
@@ -3692,8 +3742,12 @@ async function handleFetch(request, env, ctx) {
   const edgeHosts = splitCsv(cfg.EDGETUNNEL_HOSTS || '');
   const ttl = cacheTtlSeconds(cfg);
 
+  // The cache key follows the config: saving new nodes/links in the admin
+  // page must take effect on the next pull instead of serving the
+  // up-to-SUBUPTIME-hours-old cached subscription.
+  const cfgHash = (await md5Hex([cfg.LINK, cfg.LINKSUB, cfg.SUBAPI, cfg.SUBNAME, cfg.SUBUPTIME, cfg.EDGETUNNEL_HOSTS].join('\n'))).slice(0, 12);
   const cache = caches.default;
-  const cacheReq = cacheRequestFor(request, target, preferIp, preferDomain);
+  const cacheReq = cacheRequestFor(request, target, preferIp, preferDomain, cfgHash);
   if (!noCache) {
     const hit = await cache.match(cacheReq);
     if (hit) return hit;
