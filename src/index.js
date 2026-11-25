@@ -375,6 +375,16 @@ function viewFromParams(node) {
     node.params['support-x25519mlkem768'] = 'true';
     node.modified = true;
   }
+  // mihomo's xtls-rprx-vision flow is TCP-only; a VLESS node that carries
+  // flow on a ws/xhttp transport fails to connect in mihomo, and the
+  // argosbx servers (2026-11-25) no longer expect Vision on those
+  // inbounds. Strip it from non-TCP VLESS links so mihomo uses plain
+  // VLESS framing; TCP (Reality) nodes keep their flow.
+  if (node.protocol === 'vless' && node.type !== 'tcp' && node.params.flow) {
+    delete node.params.flow;
+    node.flow = '';
+    node.modified = true;
+  }
 }
 
 /** Write one view field back into params (and keep the view in sync). */
@@ -3311,7 +3321,7 @@ function resolvePrefer(url, cfg) {
 // that must invalidate previously cached responses (e.g. a fix to the
 // Clash/sing-box generator). Old entries are then orphaned and expire
 // on their own; new requests compute a fresh key and re-aggregate.
-const CACHE_VERSION = '4';
+const CACHE_VERSION = '5';
 
 function cacheTtlSeconds(env) {
   const h = parseInt(env.SUBUPTIME, 10);

@@ -830,6 +830,29 @@ await test('reality-mlkem: a non-Reality node gets no hint', async () => {
   assert(!decodeURIComponent(out).includes('support-x25519mlkem768'), 'no hint on a plain TLS node');
 });
 
+// mihomo's xtls-rprx-vision is TCP-only; a ws/xhttp VLESS node carrying
+// flow fails in mihomo, and the servers no longer expect Vision there.
+await test('vision: ws/xhttp VLESS links lose the flow param', async () => {
+  const wsNode = 'vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?encryption=none&flow=xtls-rprx-vision&type=ws&path=%2Fws#WsVision';
+  const xhttpNode = 'vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?encryption=none&flow=xtls-rprx-vision&type=xhttp&path=%2Fxh&mode=auto#XhttpVision';
+  const tcpNode = 'vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=example.com&fp=chrome&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=abcd#TcpVision';
+  for (const [link, name, wantFlow] of [[wsNode, 'WsVision', false], [xhttpNode, 'XhttpVision', false], [tcpNode, 'TcpVision', true]]) {
+    const env = { TOKEN: 'secret1', LINK: link, OMNI_KV: new MockKV() };
+    const out = await subRaw(env, '');
+    const decoded = decodeURIComponent(out);
+    assert(decoded.includes('#' + name), 'node present: ' + name);
+    if (wantFlow) assert(decoded.includes('flow=xtls-rprx-vision'), 'TCP keeps flow: ' + name);
+    else assert(!decoded.includes('flow='), 'non-TCP loses flow: ' + name + ' got ' + decoded.slice(0, 160));
+  }
+});
+
+await test('vision: clash output omits flow for ws/xhttp VLESS', async () => {
+  const wsNode = 'vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?encryption=none&flow=xtls-rprx-vision&type=ws&path=%2Fws#WsVision';
+  const env = { TOKEN: 'secret1', LINK: wsNode, OMNI_KV: new MockKV() };
+  const out = await subTarget(env, 'clash');
+  assert(!out.includes('flow: xtls-rprx-vision'), 'no vision flow line in clash for ws node');
+});
+
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
