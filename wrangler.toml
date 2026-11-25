@@ -42,3 +42,5 @@ id = "c35aa4d9cacd4a9e89ada75d9bbf59b3"
 # EDGETUNNEL_HOSTS = ""   # Extra domains treated as edgeTunnel,
 #                         # comma-separated. Built-in: *.trycloudflare.com
 #                         # and *.workers.dev are always treated as edgeTunnel.
+
+# Auto-deploy: GitHub Actions "Deploy to Cloudflare Workers" deploys on push to main (Secrets configured 2026-11-25).
