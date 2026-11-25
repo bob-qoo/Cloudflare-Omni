@@ -365,6 +365,16 @@ function viewFromParams(node) {
   node.fingerprint = p.fp || p.fingerprint || '';
   node.flow = p.flow || '';
   node.security = p.security || p.encryption || '';
+  // Xray 26.9.8+ Reality requires the client to send an X25519MLKEM768 key
+  // share; mihomo needs the explicit opt-in, which the raw link does not
+  // carry. Add the URI hint (3x-ui #6712) so current Mihomo builds apply it
+  // on import, and mark the node modified so the link is rebuilt with it.
+  // Very old Reality servers that reject ML-KEM would need a per-node
+  // override to false; ours (Xray 26.11.9) require it.
+  if (p.security === 'reality' && !p['support-x25519mlkem768']) {
+    node.params['support-x25519mlkem768'] = 'true';
+    node.modified = true;
+  }
 }
 
 /** Write one view field back into params (and keep the view in sync). */
@@ -1592,6 +1602,10 @@ function clashProxy(node) {
         L.push('    reality-opts:');
         L.push(`      public-key: ${yamlScalar(node.params.pbk)}`);
         if (node.params.sid) L.push(`      short-id: ${yamlScalar(node.params.sid)}`);
+        // Xray 26.9.8+ Reality requires an X25519MLKEM768 key share;
+        // mihomo needs this explicit opt-in (default off), otherwise the
+        // server rejects the handshake and the node just times out.
+        L.push('      support-x25519mlkem768: true');
       }
       if (node.params.packetEncoding) L.push(`    packet-encoding: ${yamlScalar(node.params.packetEncoding)}`);
       L.push('    udp: true');
@@ -3297,7 +3311,7 @@ function resolvePrefer(url, cfg) {
 // that must invalidate previously cached responses (e.g. a fix to the
 // Clash/sing-box generator). Old entries are then orphaned and expire
 // on their own; new requests compute a fresh key and re-aggregate.
-const CACHE_VERSION = '3';
+const CACHE_VERSION = '4';
 
 function cacheTtlSeconds(env) {
   const h = parseInt(env.SUBUPTIME, 10);

@@ -806,6 +806,30 @@ await test('userinfo: no subscription-userinfo header (no expiry, no usage bar)'
   }
 });
 
+// Xray 26.9.8+ Reality requires an X25519MLKEM768 key share; mihomo needs
+// the explicit opt-in, which the raw link does not carry.
+await test('reality-mlkem: raw link gains the support-x25519mlkem768 hint', async () => {
+  const env = { TOKEN: 'secret1', LINK: REALITY_NODE, OMNI_KV: new MockKV() };
+  const out = await subRaw(env, '');
+  const decoded = decodeURIComponent(out);
+  assert(decoded.includes('support-x25519mlkem768=true'), 'hint added to the rebuilt link, got: ' + decoded.slice(0, 200));
+  assert(decoded.includes('security=reality'), 'security=reality preserved');
+  assert(decoded.includes('pbk=AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd'), 'public key preserved');
+});
+
+await test('reality-mlkem: clash reality-opts carries support-x25519mlkem768', async () => {
+  const env = { TOKEN: 'secret1', LINK: REALITY_NODE, OMNI_KV: new MockKV() };
+  const out = await subTarget(env, 'clash');
+  const block = out.split('  - name: RealityNode')[1];
+  assert(block && block.includes('      support-x25519mlkem768: true'), 'mlkem flag in reality-opts');
+});
+
+await test('reality-mlkem: a non-Reality node gets no hint', async () => {
+  const env = { TOKEN: 'secret1', LINK: PLAIN_NODE, OMNI_KV: new MockKV() };
+  const out = await subRaw(env, '');
+  assert(!decodeURIComponent(out).includes('support-x25519mlkem768'), 'no hint on a plain TLS node');
+});
+
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
